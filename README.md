@@ -16,7 +16,8 @@ and avatar look, but only input → realtime VRM.
   The parent repository's `.venv` already has them, so the launcher reuses it.
 * An InstantHMR checkout with its own environment (`InstantHMR/.venv`), as
   described in `InstantHMR/README.md`. Its ONNX graphs download from Hugging
-  Face on first use.
+  Face on first use — the [Docker](#docker) image bakes them in instead, so
+  that path never touches the network.
 * Node 18+ only if you rebuild the web frontend (a built `web/dist` ships
   alongside it).
 
@@ -63,6 +64,47 @@ arrives (model loading takes a few seconds, longer on a cold cache).
 Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
 `--videos` folder. When this app sits next to the full `rtmlib` checkout, its
 `videos/` folder is listed too, so the same test clips are available.
+
+## Docker
+
+`Dockerfile` builds a self-contained image, `camenduru/VRMInstantHMR`, in which
+**nothing is downloaded when the container runs**. The build bakes in:
+
+| What | Where |
+| --- | --- |
+| the app + the three.js bundle | compiled from `web/` in a Node stage |
+| InstantHMR checkout | `/opt/InstantHMR`, pinned commit, training trees dropped |
+| InstantHMR ONNX graphs | `/opt/hf-cache` — every variant × fit 0/1/2, plus `mhr-body.onnx` |
+| RF-DETR detector weights | `/opt/roboflow` — all five variants |
+| avatar + idle animation | `/app/vrm_models` |
+
+```bash
+docker build -t camenduru/VRMInstantHMR .
+docker run --rm -it --gpus all -p 8010:8010 camenduru/VRMInstantHMR
+```
+
+Open **http://localhost:8010**. Without a GPU drop `--gpus all`; the worker
+falls back to the CPU. For a camera, add `--device /dev/video0`.
+
+`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set in the image, so a
+weight that failed to bake raises instead of being fetched — the "no runtime
+download" guarantee is enforced, not just intended. The build ends with checks
+that resolve `medium`/fit2 and construct `RFDETRMedium()` with the network
+switched off.
+
+The full build is ~9-11 GB (context ~250 MB). To trim it, keep only what you
+will actually select in the UI — the app defaults to `--model medium --fit 2
+--detector medium`, so keep those:
+
+```bash
+docker build -t camenduru/VRMInstantHMR \
+  --build-arg INSTANTHMR_VARIANTS="medium" \
+  --build-arg RFDETR_VARIANTS="medium" .
+```
+
+`feet/` and `filters/` are the upstream reference implementations the
+retargeter was ported from. They are documentation, never imported at runtime,
+and `.dockerignore` keeps their ~212 MB out of the build context.
 
 ### In the page
 

@@ -1,0 +1,42 @@
+# Build context for camenduru/VRMInstantHMR.
+#
+# Kept: app/, scripts/, vrm_models/, videos/, web sources, requirements.txt.
+# Everything the image needs at runtime is either here or fetched and pinned
+# by the Dockerfile; nothing is fetched when the container runs.
+
+# ---- local / generated state ----------------------------------------------
+.venv/
+venv/
+env/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+.git/
+.gitignore
+.cache/
+.freebuff/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# ---- frontend ------------------------------------------------------------
+# dist is rebuilt in the node stage; a stale one must never be copied in.
+web/node_modules/
+web/dist/
+web/.vite/
+web/test/
+npm-debug.log*
+
+# ---- reference projects --------------------------------------------------
+# `feet/` and `filters/` are the upstream reference implementations this app's
+# retargeter was ported from. They are documentation, never imported at
+# runtime, and together they are ~212 MB of build context.
+feet/
+filters/
+tests/
+
+# ---- docker ---------------------------------------------------------------
+Dockerfile
+.dockerignore
