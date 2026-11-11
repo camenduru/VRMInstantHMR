@@ -212,10 +212,19 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   speed alone catches a foot parked in mid air - with hysteresis so it cannot
   flicker; FootMR cancels the displacement of the joints it believes are
   static and drops the sequence onto its lowest point. Here a foot that is
-  down and slow gets a root-relative XZ anchor, eased in and out over 60/160
-  ms, with a short leash so a genuine slow step drags the anchor along rather
-  than being fought. Detection reads the NATURAL pose before any IK has touched
-  a bone, so a held foot can never hide its own release from the detector.
+  down and slow gets a root-relative XZ anchor that is **frozen for the whole
+  stance**, eased in and out over 40/120 ms. Three details decide whether that
+  does anything at all, and each one on its own measured as a no-op: an anchor
+  leashed to the sole leaves the IK nothing to correct, so the foot slides with
+  the reconstruction (a 6 cm leash still let a planted foot travel 45 cm);
+  clearing the anchor on the first missed frame re-seeds it wherever the foot
+  already is, so a 250 ms debounce carries it across the one-frame speed
+  spikes; and because the dance clip contains 10-16 cm single-frame tracking
+  jumps, the anchor and the step test read a low-passed position while the
+  speed gate keeps reading the raw one. A stance ends once the sole has walked
+  20 cm from its anchor, which is also what stops a genuine step from being
+  fought. Detection reads the NATURAL pose before any IK has touched a bone, so
+  a held foot can never hide its own release from the detector.
   `footik.js` then solves the analytic two-bone triangle for that leg and
   holds the sole on the anchor, leaving the shoe's world orientation and the
   root completely alone. That split is the point: the first versions tried to
@@ -223,8 +232,11 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   barely moves while the soles still slide ~14 cm per stance - the drift comes
   from reconstructed leg rotations, and moving the one transform shared by
   both feet can only trade foot skate for whole-body sliding. The IK
-  correction is low-passed, the knee pole is smoothed, and the global filter
-  runs after it; without those three the corrected legs glitch.
+  correction is low-passed and slew-limited to 0.3 m/s, the knee pole is
+  smoothed, and the global filter runs after it; without those the corrected
+  legs glitch. The slew limit is what keeps a release from snapping: a 15 cm
+  hold that vanished in one frame read as a pop more than twice the foot's own
+  motion, and it now unwinds at walking speed instead.
   **Stick feet to floor** in the panel switches it off, and the choice is
   remembered.
 * Grounding is on the **soles**, not on the ankle bones. An ankle is not a

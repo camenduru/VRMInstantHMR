@@ -48,10 +48,11 @@
 import * as THREE from 'three';
 
 const DEAD = 0.0015;          // m of error that is pure jitter
-const MAX_CORRECTION = 0.09;  // m: never bend a leg further than this
+const MAX_CORRECTION = 0.15;  // m: never bend a leg further than this
 const REACH = 0.995;          // stay off the fully-straight singular pose
 const TAU_CORR = 0.06;        // s: low-pass on the correction itself
 const POLE_BLEND = 0.25;      // how fast the knee pole may turn
+const MAX_SLEW = 0.3;         // m/s: how fast the correction may change at all
 
 const damp = (dt, tau) => 1 - Math.exp(-dt / tau);
 
@@ -60,6 +61,7 @@ export class FootIK {
     this.r = r;
     // Live-tunable: the measurement probes sweep this without a rebuild.
     this.maxCorrection = MAX_CORRECTION;
+    this.maxSlew = MAX_SLEW;
     this.H = new THREE.Vector3();
     this.K = new THREE.Vector3();
     this.K2 = new THREE.Vector3();
@@ -137,11 +139,32 @@ export class FootIK {
     // Low-pass the correction. A contact is a slowly varying offset, so this
     // costs almost no hold accuracy but removes the frame-to-frame IK jitter
     // that otherwise reads as a shaking knee.
+    //
+    // The low-pass alone still lets the correction collapse in one frame when
+    // a stance ends, and with a 15 cm hold that is a 15 cm snap back to the
+    // reconstruction. The slew limit caps how fast it may SHRINK, so a release
+    // becomes a short controlled catch-up at walking speed instead of a pop.
+    //
+    // It must not cap how fast it GROWS. A symmetric limit at 0.3 m/s cannot
+    // track a foot that is already moving at 0.3 m/s, so the correction never
+    // builds up and the foot slides at ~60% of its natural speed - which is
+    // exactly what a symmetric limit measured on the live feed.
     const c = this.corr[side];
     const k = damp(Number.isFinite(dt) && dt > 0 ? Math.min(0.1, dt) : 1 / 60,
       TAU_CORR);
-    c.x += (tx - c.x) * k;
-    c.y += (tz - c.y) * k;
+    let mx = (tx - c.x) * k;
+    let mz = (tz - c.y) * k;
+    if (mx * c.x + mz * c.y < 0) {          // moving towards zero: releasing
+      const mm = Math.hypot(mx, mz);
+      const lim = this.maxSlew * dt;
+      if (mm > lim) {
+        const s = lim / mm;
+        mx *= s;
+        mz *= s;
+      }
+    }
+    c.x += mx;
+    c.y += mz;
     const ex = c.x;
     const ez = c.y;
     const mag = Math.hypot(ex, ez);

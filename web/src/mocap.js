@@ -1933,6 +1933,9 @@ export class MocapRetargeter {
     // The plant IK rewrites leg rotations, so the global smoothing pass MUST
     // run after it - filtering before the plant left the IK's frame-to-frame
     // changes completely unsmoothed, which showed up as shaking knees.
+    // Planting after the filter was measured as well: it moved the residual
+    // slide by under 4% (0.105 m vs 0.109 m of travel per stance), so it buys
+    // nothing and costs the smoothing that keeps the corrected legs calm.
     // Both the filter and the IK can drop a sole by a centimetre or two, so
     // re-solve the floor LAST: this is the final write before vrm.update()
     // skins the mesh, and keeps the earlier sinking fix intact.
