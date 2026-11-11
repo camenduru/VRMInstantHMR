@@ -29,6 +29,11 @@ const btnUpload = document.getElementById('btn-upload');
 const fileInput = document.getElementById('file-input');
 const btnAvatar = document.getElementById('btn-avatar');
 const avatarInput = document.getElementById('avatar-input');
+const chromaBox = document.getElementById('chroma');
+const chromaColor = document.getElementById('chroma-color');
+const keyButtons = [...document.querySelectorAll('.key')];
+const obsMeta = document.getElementById('obs-meta');
+const btnObs = document.getElementById('btn-obs');
 
 /* --------------------------------------------------------------- scene */
 const renderer = new THREE.WebGLRenderer({
@@ -229,11 +234,71 @@ const state = {
   sources: [],
   feedAt: 0,
   avatarLabel: '',
+  chroma: false,
+  obs: false,
 };
 
 let blinkExpression = null;
 let blinkTimer = 2;
 let blinkPhase = 0;
+
+/* ------------------------------------------------- green screen / OBS view */
+// The background is a WebGL clear colour: the renderer converts it from the
+// working space straight to the output space and writes it before any tone
+// mapping, so the value picked in the swatch is the value a capture sees. That
+// is what a chroma key needs. Everything that is not the character is switched
+// off rather than painted over, so no floor edge or shadow gradient leaks into
+// the key.
+const CHROMA_KEY = new THREE.Color(0x00ff00);
+const BASE_BG = scene.background;
+const BASE_FOG = scene.fog;
+const STAGE = [floor, grid, ring, blob];
+const CHROMA_STORE = 'instanthmr.chroma';
+
+/** Pick any key colour — the swatch, the panel line and the field all follow. */
+function setChromaColor(hex) {
+  const value = hex.toLowerCase();
+  CHROMA_KEY.set(value);
+  document.documentElement.style.setProperty('--chroma', value);
+  chromaColor.value = value;
+  obsMeta.textContent = `${value.toUpperCase()} · no floor, grid or shadow`;
+  for (const key of keyButtons) {
+    const on = key.dataset.color === value;
+    key.classList.toggle('on', on);
+    key.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  try {
+    localStorage.setItem(CHROMA_STORE, value);
+  } catch {
+    /* private mode: the choice just does not survive a reload */
+  }
+}
+
+function setChroma(on) {
+  state.chroma = on;
+  scene.background = on ? CHROMA_KEY : BASE_BG;
+  scene.fog = on ? null : BASE_FOG;
+  for (const part of STAGE) part.visible = !on;
+  // Neutral light: the mint rim and the pink kicker are pretty on a dark stage
+  // but leave coloured fringes along the silhouette that the key would eat.
+  rimLight.color.set(on ? 0xffffff : 0x62f2d2);
+  warmLight.intensity = on ? 0 : 9;
+  document.body.classList.toggle('chroma', on);
+  chromaBox.checked = on;
+}
+
+function setObsLayout(on) {
+  state.obs = on;
+  document.body.classList.toggle('obs', on);
+}
+
+try {
+  const saved = localStorage.getItem(CHROMA_STORE);
+  const valid = saved && /^#[0-9a-f]{6}$/i.test(saved);
+  setChromaColor(valid ? saved : '#00ff00');
+} catch {
+  /* storage unavailable; keep the default */
+}
 
 /* --------------------------------------------------------------- helpers */
 function showToast(message, { sticky = false, error = false } = {}) {
@@ -587,6 +652,55 @@ followRoot.addEventListener('change', () => {
   if (state.retargeter) state.retargeter.setRootFollow(followRoot.checked);
 });
 
+/* ------------------------------------------------- green screen / OBS wiring */
+chromaBox.addEventListener('change', () => setChroma(chromaBox.checked));
+chromaColor.addEventListener('input', () => setChromaColor(chromaColor.value));
+
+for (const key of keyButtons) {
+  key.addEventListener('click', () => {
+    setChromaColor(key.dataset.color);
+    // picking a key is a request to see it
+    if (!state.chroma) setChroma(true);
+  });
+}
+
+btnObs.addEventListener('click', () => {
+  const url = new URL(window.location.href);
+  url.searchParams.set('obs', '1');
+  window.open(url.toString(), '_blank', 'noopener');
+});
+
+// ?obs=1 is the capture layout: green field, no controls. ?green=1 keeps the
+// controls and only drops the stage. G and H flip the same two things live, so
+// a window capture can be previewed without reloading.
+const query = new URLSearchParams(window.location.search);
+if (query.has('obs')) {
+  setChroma(true);
+  setObsLayout(true);
+} else if (query.has('green') || query.has('chroma')) {
+  setChroma(true);
+}
+
+window.addEventListener('keydown', (event) => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const tag = event.target?.tagName;
+  const type = event.target?.type;
+  const typing = tag === 'TEXTAREA' || tag === 'SELECT' ||
+    (tag === 'INPUT' && !['checkbox', 'radio', 'button', 'range'].includes(type));
+
+  if (event.key === 'Escape') {
+    setObsLayout(!state.obs);
+  } else if (!typing && event.key.toLowerCase() === 'g') {
+    setChroma(!state.chroma);
+  } else if (!typing && event.key.toLowerCase() === 'h') {
+    setObsLayout(!state.obs);
+  } else {
+    return;
+  }
+  showToast(`${state.chroma ? 'Chroma key' : 'Stage'} · ` +
+    `${state.obs ? 'controls hidden' : 'controls shown'}`);
+});
+
 /* ---------------------------------------------------------------- uploads */
 btnUpload.addEventListener('click', () => fileInput.click());
 
@@ -689,7 +803,10 @@ window.addEventListener('resize', () => {
   fitCamera();
 });
 
-window.mocap = { state, scene, camera, controls, avatarRoot, renderer };
+window.mocap = {
+  state, scene, camera, controls, avatarRoot, renderer,
+  setChroma, setChromaColor, setObsLayout,
+};
 
 requestAnimationFrame(animate);
 

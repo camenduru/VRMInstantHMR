@@ -316,6 +316,28 @@ def _():
             assert client.get('/api/live').json()['state'] == 'off'
 
 
+@check('the page offers a green-screen capture layout for OBS')
+def _():
+    from fastapi.testclient import TestClient
+    from app.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        capture = Capture([Path(tmp)])
+        live = live_mod.LiveInstantHMR()
+        app = create_app(capture, live, start_live=False)
+        with TestClient(app) as client:
+            page = client.get('/')
+            assert page.status_code == 200, page.status_code
+            html = page.text
+            assert 'id="chroma"' in html, 'no green-screen toggle'
+            assert 'id="btn-obs"' in html, 'no clean-window link'
+            assert 'id="key-green"' in html and 'id="key-blue"' in html, \
+                'no green/blue key presets'
+            assert 'id="chroma-color"' in html, 'no custom key colour'
+            assert '/assets/index-' in html and '.js' in html, \
+                'the page is not the built bundle'
+
+
 print('\n'.join(results))
 if FAILED:
     sys.exit(1)

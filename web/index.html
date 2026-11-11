@@ -51,6 +51,30 @@
         <p id="avatar-meta" class="meta">—</p>
       </section>
 
+      <section>
+        <div class="field-head">
+          <span class="label">OBS output</span>
+          <button id="btn-obs" type="button" class="link"
+                  title="Open a window that shows only the avatar on green">Clean window</button>
+        </div>
+        <div class="row">
+          <label class="check" title="The key colour behind the character, with no floor, grid or shadow, so OBS can chroma-key it. Press G to toggle, H to hide the controls.">
+            <input id="chroma" type="checkbox" />
+            <span>Chroma key</span>
+          </label>
+          <div class="keys" role="group" aria-label="Key colour">
+            <button id="key-green" class="key" type="button" data-color="#00ff00"
+                    title="Chroma green · #00FF00" aria-label="Chroma green"></button>
+            <button id="key-blue" class="key" type="button" data-color="#0000ff"
+                    title="Chroma blue · #0000FF" aria-label="Chroma blue"></button>
+            <input id="chroma-color" type="color" value="#00ff00"
+                   aria-label="Custom key colour"
+                   title="Pick any key colour" />
+          </div>
+        </div>
+        <p id="obs-meta" class="meta">#00FF00 · no floor, grid or shadow</p>
+      </section>
+
       <p class="hint">
         Pick a video or a camera. The avatar follows the reconstructed 3D body
         in real time; drag to orbit, right-drag to pan, wheel to zoom.

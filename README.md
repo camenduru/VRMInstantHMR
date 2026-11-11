@@ -71,8 +71,40 @@ Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
   the avatar dances on its mark; enable it to let the avatar step with the
   person, bounded to a small cone.
 * **Avatar** – **Load VRM…** swaps the avatar from disk, locally.
-* Drag to orbit, right-drag to pan, wheel to zoom. The bottom-left preview
+* **OBS output** – **Chroma key** puts a flat key colour behind the avatar and
+  takes the floor, grid, ring and blob shadow out of the shot. The two swatches
+  are the usual keys — green `#00FF00` and blue `#0000FF` — and the picker
+  beside them takes any colour; the choice is remembered. **Clean window**
+  opens the same view with all the controls hidden.
+* Drag to orbit, right-drag to pan, wheel to zoom. The bottom-right preview
   shows the input with the reconstructed 22-joint skeleton on it.
+
+### OBS / green screen
+
+For a stream or a recording you usually want only the character, on a field a
+chroma key can remove:
+
+* **Browser source (cleanest).** Add `http://127.0.0.1:8010/?obs=1` as an OBS
+  browser source at your stream resolution, then add a **Chroma Key** filter
+  whose key colour matches the swatch — the default `#00FF00`, or `#0000FF` if
+  the character itself wears green — with similarity ~400 and smoothness ~80.
+  The canvas follows the source size, so the avatar reframes itself if you
+  change the resolution. The chosen colour is remembered in the browser, so a
+  browser source can be set up once.
+* **Window capture.** Click **Clean window** (or open `?obs=1` in a tab) and
+  capture that window: no panels, no preview, no furniture.
+
+In a normal window `G` toggles the key field and `H` (or `Esc`) hides and
+shows the controls, so the exact capture layout can be previewed without
+reloading. `?green=1` turns the key field on and keeps the controls; the
+**Chroma key** checkbox does the same thing.
+
+The background is a WebGL clear colour, which is written to the framebuffer
+after the output colour-space conversion but before tone mapping, so the pixels
+really are the picked colour rather than a tone-mapped approximation. The mint
+rim light turns neutral white and the pink kicker goes off in this mode: they
+look good on a dark stage but leave coloured fringes along the silhouette that
+the key would eat.
 
 ## How it works
 
