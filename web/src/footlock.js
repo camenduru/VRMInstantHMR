@@ -1,5 +1,5 @@
 /**
- * Foot planting: keep a planted foot on the floor.
+ * Foot planting: decide which soles are in contact with the floor.
  *
  * Both reference projects in `feet/` treat contact as the thing to detect
  * first and then hold. `UnderPressure/models.py` labels a foot "in contact"
@@ -10,187 +10,158 @@
  * displacement of the joints it believes are stationary, then drops the whole
  * sequence onto the ground at its lowest point.
  *
- * There is no mesh, no batch and no IK here, so the correction is a root
- * offset rather than an optimisation. While a foot is down and slow, the root
- * is nudged so that foot's height stays on the floor and its sideways drift
- * stops. The nudge is an integrator with clamps: a small gain can hold a plant
- * against a steady error without winding up, and the offset leaks back to zero
- * as soon as both feet leave the ground, so a jump never keeps the avatar
- * pulled down.
+ * This module only DETECTS. The hold itself is a two-bone leg IK in
+ * `footik.js`. That split matters: the first two versions of this pass tried
+ * to cancel skate with a ROOT translation, which cannot work here. With
+ * "follow root" off the root barely moves while the feet still slide ~14 cm
+ * per stance, so the drift comes from the reconstructed LEG ROTATIONS, not
+ * from body travel. Moving the root to cancel one foot just translates the
+ * whole avatar (visible whole-body sliding), and a leaky root hold adds
+ * centimetre-scale frame-to-frame jitter that makes the measured drift worse.
+ * Only a per-leg constraint can hold a foot without moving the character.
  *
- * Detecting the contact is deliberately conservative. Height alone is not
- * enough - a foot on the ground moves fast during a step - and speed alone is
- * not either, because a foot parked in mid air is stationary too. Requiring
- * both, with hysteresis so a foot does not flicker in and out, is what the
- * reference projects do and what works on live data.
+ * Detection therefore runs on the NATURAL pose, before the IK has touched any
+ * bone. That removes the classic foot-lock failure where a hard hold makes the
+ * foot look stationary forever, so a real step can never release: the IK never
+ * hides the reconstruction's own motion from this detector.
+ *
+ * Anchors are stored in ROOT-RELATIVE XZ, so enabling "follow root" cannot
+ * leave stale world-space anchors behind. A short leash lets a genuine slow
+ * step drag its anchor along once the natural sole is more than a few
+ * centimetres away; short-term jitter never moves it.
  */
 
 import * as THREE from 'three';
 
 const CONTACT = {
-  height: 0.055,        // metres over the bind height that still counts as down
-  speed: 0.45,          // metres per second that still counts as planted
-  releaseHeight: 0.085, // hysteresis: hold the contact until it is clearly up
-  releaseSpeed: 0.8,
-  attack: 0.06,         // seconds to count as planted
-  release: 0.22,        // seconds to count as lifted
-  anchor: 0.35,         // seconds for the hold point to follow a walking foot,
-                        // so a real step is not fought, only a slide
-  gainY: 0.45,          // seconds, height integrator
-  gainXZ: 0.8,          // seconds, sideways integrator
-  leak: 1.2,            // seconds for the offset to fade out with both feet up
-  dead: 0.002,          // metres of error that are pure jitter
-  maxY: 0.05,           // metres the plant may move the root vertically
-  maxXZ: 0.06,          // ... and horizontally
+  height: 0.05,         // m over the bind sole that still counts as down
+  releaseHeight: 0.085, // hysteresis: keep the contact until it is clearly up
+  speed: 0.42,          // m/s of natural sole motion that still counts as planted
+  releaseSpeed: 0.75,
+  attack: 0.06,         // s to ramp a contact in
+  release: 0.16,        // s to ramp it out
+  leash: 0.06,          // m a natural sole may outrun its anchor before it drags it
 };
 
 const damp = (dt, tau) => 1 - Math.exp(-dt / tau);
-const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+class FootState {
+  constructor() {
+    this.weight = 0;
+    this.planted = false;
+    this.anchored = false;
+    this.seen = false;
+    this.speed = 0;
+    this.error = 0;
+    this.anchor = new THREE.Vector2();  // root-relative x, z
+    this.last = new THREE.Vector2();    // previous natural root-relative x, z
+    this.err = new THREE.Vector2();     // anchor - natural sole (x, z)
+  }
+
+  clear() {
+    this.weight = 0;
+    this.planted = false;
+    this.anchored = false;
+    this.seen = false;
+    this.speed = 0;
+    this.error = 0;
+    this.err.set(0, 0);
+  }
+}
 
 export class FootLock {
   constructor() {
     this.enabled = true;
-    /** The root offset to add to this frame's target. */
-    this.correction = new THREE.Vector3();
-    /** The integrator behind it. */
-    this.offset = new THREE.Vector3();
-    this._feet = [newFoot(), newFoot()];
+    // Live-tunable: the measurement probes sweep this without a rebuild.
+    this.leash = CONTACT.leash;
+    this.feet = [new FootState(), new FootState()];
+    this._feet = this.feet;  // legacy name used by the measurement probes
+    this._u = new THREE.Vector2();
   }
 
   reset() {
-    this.correction.set(0, 0, 0);
-    this.offset.set(0, 0, 0);
-    for (const foot of this._feet) {
-      foot.weight = 0;
-      foot.planted = false;
-      foot.anchored = false;
-      foot.seen = false;
-      foot.err.set(0, 0, 0);
+    for (const foot of this.feet) foot.clear();
+  }
+
+  /** No pose / pass switched off: ramp the contacts out instead of snapping. */
+  release(dt) {
+    const k = damp(Number.isFinite(dt) && dt > 0 ? dt : 1 / 60,
+      CONTACT.release);
+    for (const foot of this.feet) {
+      foot.weight *= 1 - k;
+      if (foot.weight < 1e-3) {
+        foot.weight = 0;
+        foot.planted = false;
+        foot.anchored = false;
+      }
+      foot.err.set(0, 0);
+      foot.error = 0;
     }
   }
 
   /**
-   * Consume this frame's foot positions and return the root offset.
+   * Consume this frame's NATURAL sole positions.
    *
-   * `left`/`right` are the feet's world positions (their bind-pose height is
-   * the floor reference for the sole), `groundY` that height, `strength` the
-   * share of the correction to apply (0 while the pose is still blending in).
+   * `left`/`right` are the lowest skin points of each foot in world space,
+   * `groundY` their bind-pose floor height, `rootX`/`rootZ` the avatar root,
+   * and `strength` the share of the pass to apply (0 in a close-up).
    */
-  solve(left, right, groundY, dt, strength = 1) {
-    const correction = this.correction;
-    correction.set(0, 0, 0);
-    dt = Number.isFinite(dt) && dt > 0 ? clamp(dt, 0.001, 0.1) : 1 / 60;
-    strength = Number.isFinite(strength) ? clamp(strength, 0, 1) : 0;
-    if (!left || !right || !Number.isFinite(groundY)) return correction;
-
-    let sum = 0;
-    let support = null;
-    let lowest = Infinity;
+  update(left, right, groundY, rootX, rootZ, dt, strength = 1) {
+    dt = Number.isFinite(dt) && dt > 0
+      ? Math.min(0.1, Math.max(0.001, dt)) : 1 / 60;
+    const active = Number.isFinite(strength) && strength > 1e-3;
+    const soles = [left, right];
     for (let i = 0; i < 2; i++) {
-      const p = i ? right : left;
-      const foot = this._feet[i];
-      if (!Number.isFinite(p.x) || !Number.isFinite(p.y) ||
+      const p = soles[i];
+      const foot = this.feet[i];
+      if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) ||
           !Number.isFinite(p.z)) {
-        // A missing foot is not a planted one; hold the old error while the
-        // weight ramps out, but do not measure anything from it.
-        foot.weight += (0 - foot.weight) * damp(dt, CONTACT.release);
-        if (foot.weight < 1e-3) {
-          foot.weight = 0;
-          foot.planted = false;
-        }
+        foot.weight *= 1 - damp(dt, CONTACT.release);
+        foot.planted = false;
+        foot.anchored = false;
+        foot.err.set(0, 0);
         continue;
       }
-      const height = p.y - groundY;
+      const u = this._u.set(p.x - rootX, p.z - rootZ);
       const speed = foot.seen
-        ? Math.hypot(p.x - foot.last.x, p.z - foot.last.z) / dt
-        : 0;
-      foot.last.copy(p);
+        ? Math.hypot(u.x - foot.last.x, u.y - foot.last.y) / dt : 0;
+      foot.speed = speed;
+      foot.last.copy(u);
       foot.seen = true;
 
+      const height = p.y - groundY;
       const down = height < (foot.planted ? CONTACT.releaseHeight : CONTACT.height);
       const slow = speed < (foot.planted ? CONTACT.releaseSpeed : CONTACT.speed);
-      const contact = down && slow;
+      const contact = active && down && slow;
       foot.planted = contact;
       foot.weight += ((contact ? 1 : 0) - foot.weight) *
         damp(dt, contact ? CONTACT.attack : CONTACT.release);
-      if (contact) {
-        if (!foot.anchored) {
-          foot.anchor.set(p.x, p.z);
-          foot.anchored = true;
-        } else {
-          // follow the foot slowly, so walking is not mistaken for sliding
-          const k = damp(dt, CONTACT.anchor);
-          foot.anchor.x += (p.x - foot.anchor.x) * k;
-          foot.anchor.y += (p.z - foot.anchor.y) * k;
-        }
-        foot.err.set(foot.anchor.x - p.x, groundY - p.y, foot.anchor.y - p.z);
-      } else {
-        // released: keep the last error so the correction ramps out over a
-        // lifted foot instead of chasing it upward
+
+      if (!contact) {
         foot.anchored = false;
-      }
-      if (foot.weight < 1e-3) {
-        foot.weight = 0;
+        foot.error = 0;
+        foot.err.set(0, 0);
         continue;
       }
-      sum += foot.weight;
-      if (p.y < lowest) {
-        lowest = p.y;
-        support = foot;
+      if (!foot.anchored) {
+        foot.anchor.copy(u);
+        foot.anchored = true;
+      } else {
+        // Leash: a real slow step drags the anchor along, but only the part
+        // beyond `leash`. Bounded leg bend, no hard fight with a genuine step,
+        // and no sudden jump when a stance turns into a shuffle.
+        const dx = u.x - foot.anchor.x;
+        const dz = u.y - foot.anchor.y;
+        const d = Math.hypot(dx, dz);
+        if (d > this.leash) {
+          const pull = (d - this.leash) / d;
+          foot.anchor.x += dx * pull;
+          foot.anchor.y += dz * pull;
+        }
       }
+      foot.err.set(foot.anchor.x - u.x, foot.anchor.y - u.y);
+      foot.error = foot.err.length();
     }
-
-    const offset = this.offset;
-    if (sum <= 1e-3) {
-      // Nothing is down: let the offset relax, so a jump or a lifted pose is
-      // never held at a lower height than the person actually has.
-      offset.multiplyScalar(1 - damp(dt, CONTACT.leak));
-      correction.copy(offset).multiplyScalar(strength);
-      return correction;
-    }
-
-    // Sideways: the mean of the planted feet, with a dead zone so a foot that
-    // is merely noisy does not shake the whole avatar.
-    let ex = 0;
-    let ez = 0;
-    for (const foot of this._feet) {
-      if (!foot.weight) continue;
-      ex += foot.err.x * foot.weight;
-      ez += foot.err.z * foot.weight;
-    }
-    ex /= sum;
-    ez /= sum;
-    const slide = Math.hypot(ex, ez);
-    if (slide < CONTACT.dead) {
-      ex = 0;
-      ez = 0;
-    } else {
-      const keep = (slide - CONTACT.dead) / slide;
-      ex *= keep;
-      ez *= keep;
-    }
-    const kxz = damp(dt, CONTACT.gainXZ);
-    offset.x = clamp(offset.x + ex * kxz, -CONTACT.maxXZ, CONTACT.maxXZ);
-    offset.z = clamp(offset.z + ez * kxz, -CONTACT.maxXZ, CONTACT.maxXZ);
-
-    // Height: the support foot, the lowest of those down.
-    const ky = damp(dt, CONTACT.gainY);
-    offset.y = clamp(offset.y + support.err.y * support.weight * ky,
-      -CONTACT.maxY, CONTACT.maxY);
-
-    correction.copy(offset).multiplyScalar(strength);
-    return correction;
+    return this.feet;
   }
-}
-
-function newFoot() {
-  return {
-    weight: 0,
-    planted: false,
-    anchored: false,
-    seen: false,
-    anchor: new THREE.Vector2(),   // x, z of the hold point
-    last: new THREE.Vector3(),
-    err: new THREE.Vector3(),      // x, y, z error (y is height over ground)
-  };
 }

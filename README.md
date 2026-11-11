@@ -69,9 +69,12 @@ Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
 * **InstantHMR 3D** – starts/stops the live worker; the button shows the
   measured rate once it is running. **Follow movement** is off by default so
   the avatar dances on its mark; enable it to let the avatar step with the
-  person, bounded to a small cone. **Stick feet to floor** keeps a planted
-  foot from floating or sliding (see [Filters](#filters) for the smoothing
-  that runs alongside it).
+  person, bounded to a small cone. **Stick feet to floor** finds a foot that is
+  down and barely moving and holds that sole where it landed with a two-bone
+  leg IK, so it stops skating sideways without dragging the whole avatar.
+  Height is a separate floor constraint; the global smoothing pass runs
+  *after* the plant so the corrected leg cannot shake (see
+  [Filters](#filters)).
 * **Smoothing** – one global filter bank over the whole rig, built from the
   real-time methods of the reference projects in `filters/` (see
   [Filters](#filters)): **Butterworth**, **One Euro**, **Exponential**,
@@ -152,12 +155,15 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   height would let a crouch fold the legs and leave the feet hanging in the
   air. A crouch is measured as the hips dropping towards the support foot (the
   lower ankle, so a kick never lifts the body), expressed against the person's
-  own standing height, and scaled to this avatar's leg; a slow trim then sinks
-  the root until the support ankle really is back at its bind height, so the
-  soles stay on the floor. Horizontal travel is the optional **Follow
-  movement** checkbox and is confined to a small cone around the spot where
-  tracking began, so reconstruction depth noise can never walk the avatar off
-  its mark.
+  own standing height, and scaled to this avatar's leg; a slow trim removes the
+  remaining bias against the measured **sole** height. The crouch term is only
+  a feed-forward estimate, though, and the legs are aimed with fixed bone
+  lengths, so the two disagree by centimetres on a fast step. The posed soles
+  get the last word: `grounding.js` is a one-sided solve that lifts the root
+  whenever a sole would end up below the bind floor, and leaves a real hop
+  above it alone. Horizontal travel is the optional **Follow movement**
+  checkbox and is confined to a small cone around the spot where tracking
+  began, so reconstruction depth noise can never walk the avatar off its mark.
 * **Close-ups and shoulder-height shots** are handled separately, because a
   camera that cuts the body at the waist leaves the reconstruction no legs and
   no floor. It fills the gap with a guess — hips dropped, thighs swung forward,
@@ -189,35 +195,54 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   auxiliary landmarks are low-passed in camera space *before* any bone is
   solved, the root translation with them, and every bone's finished local
   rotation once afterwards — so a bad frame is quietened on the way in and the
-  residual is quietened on the way out. Ten filters share the cutoff knob,
-  ported from the reference projects in `filters/` (see [Filters](#filters)).
+  residual is quietened on the way out. That second pass is deliberately AFTER
+  the foot plant: the plant's leg IK rewrites rotations on the way out, so a
+  filter that ran first would leave every IK correction unsmoothed and the
+  corrected legs would shake. Ten filters share the cutoff knob, ported from
+  the reference projects in `filters/` (see [Filters](#filters)).
   Quaternions are filtered component-wise on one hemisphere and renormalised,
   which is stable and needs no wrap-around bookkeeping. On top of the filter, a
   deadband holds sub-threshold movement: a low-pass decays towards a still pose
   but never quite reaches one, so the last shiver needs a floor, not a
   smaller cutoff.
-* `web/src/footlock.js` is the foot plant, and it takes its structure from the
-  `feet/` reference projects: contact is detected first, then held.
-  `UnderPressure` labels a foot from its height over the ground *and* its
-  speed - height alone catches a foot mid-step, speed alone catches a foot
-  parked in mid air - with hysteresis so it cannot flicker; FootMR cancels the
-  displacement of the joints it believes are static and drops the sequence
-  onto its lowest point. Here, while a foot is down and slow, the root gets an
-  offset that keeps that foot's height on the floor and cancels its sideways
-  slide, with the hold point following the foot over a third of a second so a
-  real step is not fought. The offset is an integrator with clamps, so it can
-  hold a plant against a steady error without winding up, and it leaks back to
-  zero as soon as both feet leave the ground - a jump is never pulled down.
+* **Foot planting** is split in two: `web/src/footlock.js` only DETECTS
+  contact, `web/src/footik.js` holds it. Both take their structure from the
+  `feet/` reference projects: `UnderPressure` labels a foot from its height
+  over the ground *and* its speed - height alone catches a foot mid-step,
+  speed alone catches a foot parked in mid air - with hysteresis so it cannot
+  flicker; FootMR cancels the displacement of the joints it believes are
+  static and drops the sequence onto its lowest point. Here a foot that is
+  down and slow gets a root-relative XZ anchor, eased in and out over 60/160
+  ms, with a short leash so a genuine slow step drags the anchor along rather
+  than being fought. Detection reads the NATURAL pose before any IK has touched
+  a bone, so a held foot can never hide its own release from the detector.
+  `footik.js` then solves the analytic two-bone triangle for that leg and
+  holds the sole on the anchor, leaving the shoe's world orientation and the
+  root completely alone. That split is the point: the first versions tried to
+  cancel skate with a root offset, but with **Follow movement** off the root
+  barely moves while the soles still slide ~14 cm per stance - the drift comes
+  from reconstructed leg rotations, and moving the one transform shared by
+  both feet can only trade foot skate for whole-body sliding. The IK
+  correction is low-passed, the knee pole is smoothed, and the global filter
+  runs after it; without those three the corrected legs glitch.
   **Stick feet to floor** in the panel switches it off, and the choice is
   remembered.
 * Grounding is on the **soles**, not on the ankle bones. An ankle is not a
   sole: point the toes and the ankle rises while the shoe goes through the
   floor, and every bone still reports a sensible height — which is what "the
   mesh sinks but the bones are fine" looks like. `mapSoles()` samples the
-  avatar's skin once, in its bind pose, keeps the lowest vertices per foot
-  (attached to the foot and toe bones) and the trim then holds those probes on
-  the floor the skin sat on at bind. Ankle pitch, heel lift and pointed toes
-  are all in the measurement instead of being ignored.
+  avatar's skin once, in its bind pose, and keeps the lowest vertex per small
+  XZ cell for each foot (attached to the foot and toe bones) - a sole
+  *outline*, not just the eight lowest points clustered around one spot. A
+  heel or toe that was not lowest in the bind pose can easily be lowest in a
+  pitched one, so sampling only the bottom of the bind sole misses the very
+  skin that goes through the floor. `grounding.js` measures the lowest posed
+  sole and lifts the root by exactly the amount that puts it back on the bind
+  floor, never lowering it, so a hop survives. It is a solve rather than an
+  integrator: the slow trim arrived a second late and let the skin sit up to
+  9 cm under the floor. The constraint runs once on the root target and once
+  more as the FINAL write of the frame - after the plant and the output
+  filter, since both can rotate a leg and drop a sole by a centimetre or two.
 * The preview skeleton is drawn from the worker's 2D landmarks, so no second
   pose model is running.
 
@@ -229,8 +254,12 @@ the page) stops it; the server also stops it on shutdown.
 
 `web/src/filters.js` is one filter bank applied to the whole rig: the
 reconstructed joints and landmarks on the way in, and every bone's finished
-local rotation on the way out. The methods are the real-time ones from the
-reference projects in `filters/`:
+local rotation on the way out. The output pass runs after the foot plant's leg
+IK so its corrections are filtered too, and the frame closes with the
+one-sided floor constraint. In both the 2D and 3D update paths the order is
+`floor clamp → plant → global smoothing → floor clamp`; a hop above the floor
+is never pulled down. The methods are the real-time ones from the reference
+projects in `filters/`:
 
 | Panel | Method | Ported from | Note |
 | --- | --- | --- | --- |

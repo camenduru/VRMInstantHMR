@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { mapBlendshapes } from './face-retarget.js';
 import { MotionFilter } from './filters.js';
 import { FootLock } from './footlock.js';
+import { FootIK } from './footik.js';
 import { floorTargetY, FLOOR_TAU } from './grounding.js';
 
 /**
@@ -326,10 +327,12 @@ export class MocapRetargeter {
     this._soleA = new THREE.Vector3();
     this._soleB = new THREE.Vector3();
     this._soleTmp = new THREE.Vector3();
-    // Foot planting (footlock.js): a root offset that holds a planted foot on
-    // the floor. main.js can switch it off from the panel.
+    // Foot planting: footlock.js detects contact on the natural pose and
+    // footik.js holds a planted sole with a two-bone leg IK. A root offset
+    // cannot do this - the skate comes from leg rotations, so translating the
+    // root only drags the whole avatar. main.js can switch the pass off.
     this.footLock = new FootLock();
-    this._lockCorrection = new THREE.Vector3();
+    this.footIK = new FootIK(this);
     this._eyePos = new THREE.Vector3();
     this._eyeA = new THREE.Vector3();
     this._eyeB = new THREE.Vector3();
@@ -869,6 +872,9 @@ export class MocapRetargeter {
     this.blend += (targetBlend - this.blend) * damp(dt, TAU_BLEND);
     if (!hasPose && this.blend < 0.002) {
       this.blend = 0;
+      // No pose means no contact: relax the plant hold instead of carrying a
+      // stale offset into the next tracked segment.
+      this.footLock.release(dt);
       this.root.position.lerp(this._target.set(0, 0, 0), damp(dt, TAU_ROOT));
       return;
     }
@@ -973,7 +979,6 @@ export class MocapRetargeter {
       clamp((0.6 - ny) * 1.2, -0.15, 0.15) * weight,
       0,
     );
-    this._target.add(this._footPlant(dt, weight, 1));
     if (this.smoothing.active) this.smoothing.vector(this._target, 'root', dt);
     const floor = this._floorSample(1);
     if (floor.on) {
@@ -981,6 +986,9 @@ export class MocapRetargeter {
         this.rest.sole, floor.ground).y;
     }
     this.root.position.lerp(this._target, damp(dt, TAU_ROOT));
+    // Same order as update3D: plant -> smooth -> re-solve the floor.
+    this._floorClamp(this._floorSample(1));
+    this._plantFeet(dt, weight, 1);
     this._applyOutputFilter(dt);
     this._floorClamp(this._floorSample(1));
   }
@@ -1896,7 +1904,6 @@ export class MocapRetargeter {
     const follow = this.rootFollow ? ground : 0;
     this._target.set(x * weight * follow, y * weight,
       z * weight * follow);
-    this._target.add(this._footPlant(dt, weight, ground));
     // the root is the one translation the avatar has, so it gets the same
     // filter as the joints: a pelvis that shivers by a centimetre shakes the
     // whole character, feet included
@@ -1904,11 +1911,11 @@ export class MocapRetargeter {
 
     // Hard, one-sided floor solve. The crouch term above is feed-forward from
     // the person's hip height, but these legs are aimed by direction with fixed
-    // bone lengths, so the two disagree by centimetres on a fast step. The slow
-    // trim and the foot lock are integrators: they wind up, clamp, and arrive a
-    // second late - which is exactly how the soles ended up 9 cm under the
-    // floor. The posed soles are ground truth, so clamp the target after
-    // smoothing (otherwise the filter drags it back down) and recover quickly.
+    // bone lengths, so the two disagree by centimetres on a fast step. The
+    // slow trim is an integrator that arrives a second late - which is how the
+    // soles ended up 9 cm under the floor. The posed soles are ground truth,
+    // so clamp the target after smoothing (otherwise the filter drags it back
+    // down) and recover quickly.
     const floor = this._floorSample(ground);
     let floored = false;
     if (floor.on) {
@@ -1917,17 +1924,20 @@ export class MocapRetargeter {
       this._target.y = fit.y;
       floored = fit.floored;
     }
-
     const k = damp(dt, TAU_ROOT);
     this.root.position.x += (this._target.x - this.root.position.x) * k;
     this.root.position.z += (this._target.z - this.root.position.z) * k;
     const ky = damp(dt, floored ? FLOOR_TAU : TAU_ROOT_Y);
     this.root.position.y += (this._target.y - this.root.position.y) * ky;
 
-    // The output filter rewrites leg rotations, which can drop a sole by a
-    // centimetre or two AFTER the target was solved. Re-measure on the final
-    // pose and constrain the root once more - this is the last write before
-    // vrm.update() skins the mesh, so it is the height the viewer actually sees.
+    // The plant IK rewrites leg rotations, so the global smoothing pass MUST
+    // run after it - filtering before the plant left the IK's frame-to-frame
+    // changes completely unsmoothed, which showed up as shaking knees.
+    // Both the filter and the IK can drop a sole by a centimetre or two, so
+    // re-solve the floor LAST: this is the final write before vrm.update()
+    // skins the mesh, and keeps the earlier sinking fix intact.
+    this._floorClamp(this._floorSample(ground));
+    this._plantFeet(dt, weight, ground);
     this._applyOutputFilter(dt);
     this._floorClamp(this._floorSample(ground));
   }
@@ -1964,20 +1974,49 @@ export class MocapRetargeter {
   }
 
   /**
-   * The root offset that keeps a planted foot on the floor (footlock.js).
+   * Hold every planted foot where it landed (footlock.js + footik.js).
    *
-   * The feet have been posed by now, so their world height is the measurement:
-   * an ankle riding above its bind height means the sole is off the floor.
-   * Returns the shared correction vector, zero when the pass is off.
+   * Detection runs on the NATURAL pose, so the IK can never hide a real step
+   * from the contact detector; the IK then re-poses each leg independently.
+   * The root is left completely alone - it is the one transform shared by
+   * both feet, so moving it can only trade foot skate for whole-body sliding.
+   *
+   * Order matters: this runs BEFORE the global output filter (see update3D),
+   * because the IK rewrites leg rotations and filtering first left those
+   * corrections completely unsmoothed. The filter is followed by one last
+   * floor clamp, so neither pass can push a sole through the floor.
    */
-  _footPlant(dt, weight, ground) {
-    const c = this._lockCorrection;
-    c.set(0, 0, 0);
-    if (!this.footLock.enabled || this.rest.sole === undefined) return c;
-    if (!this.b.leftFoot || !this.b.rightFoot) return c;
+  _plantFeet(dt, weight, ground) {
+    const lock = this.footLock;
+    const strength = weight * ground;
+    if (this.rest.sole === undefined ||
+        !this.b.leftFoot || !this.b.rightFoot) return;
+
+    // Natural soles, before any IK has touched a bone. Detection runs even
+    // with the pass switched off, so toggling the panel back on never picks
+    // up a stale anchor (and the measurement probes can compare ON and OFF
+    // on the very same contact windows).
     const left = this.solePoint('left', this._soleA);
     const right = this.solePoint('right', this._soleB);
-    return this.footLock.solve(left, right, this.rest.sole, dt, weight * ground);
+    const rx = this.root.position.x;
+    const rz = this.root.position.z;
+    const feet = lock.update(left, right, this.rest.sole, rx, rz,
+      dt, strength);
+
+    // Ease the constraint in/out with the checkbox and with the close-up
+    // fade, instead of snapping a leg to its anchor on the first frame.
+    const want = lock.enabled && strength > 1e-3 ? 1 : 0;
+    const gain = this._plantGain || 0;
+    this._plantGain = gain + (want - gain) * damp(dt, 0.12);
+    // Call plant for BOTH sides every frame, even at weight 0: footik.js
+    // low-passes its correction and needs the chance to decay it to zero.
+    // Skipping those frames is what made a lifting leg snap and shake.
+    for (let i = 0; i < 2; i++) {
+      const foot = feet[i];
+      const side = i ? 'right' : 'left';
+      this.footIK.plant(side, foot.anchor.x + rx, foot.anchor.y + rz,
+        foot.weight * strength * this._plantGain, dt);
+    }
   }
 
   /**
@@ -2045,5 +2084,10 @@ export class MocapRetargeter {
     this._rootDelta.set(0, 0, 0);
     this.smoothing.reset();
     this.footLock.reset();
+    this._plantGain = 0;
+    if (this.footIK) {
+      this.footIK.corr.left.set(0, 0);
+      this.footIK.corr.right.set(0, 0);
+    }
   }
 }
