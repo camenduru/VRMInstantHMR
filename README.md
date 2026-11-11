@@ -70,6 +70,13 @@ Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
   measured rate once it is running. **Follow movement** is off by default so
   the avatar dances on its mark; enable it to let the avatar step with the
   person, bounded to a small cone.
+* **Smoothing** – one global filter bank over the whole rig. **Butterworth**
+  (2nd-order, the default: the flattest passband for the lag it costs),
+  **One Euro** (adaptive: steady while a limb is still, quick when it moves) or
+  **Exponential** (plain single-pole), or **Off**. **Smoothing** sets the
+  cutoff, **De-jitter** holds movement smaller than a threshold as tracking
+  noise, which is what removes the last stand-still shiver. The choice is
+  remembered in the browser.
 * **Avatar** – **Load VRM…** swaps the avatar from disk, locally.
 * **OBS output** – **Chroma key** puts a flat key colour behind the avatar and
   takes the floor, grid, ring and blob shadow out of the shot. The two swatches
@@ -173,6 +180,19 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   elbow-crease landmarks that carry the arm's roll are also ignored when the
   arm they belong to is not in shot, so the roll cannot spin either. Unlike the
   legs, this is per arm: one arm in frame is trusted while the other hangs.
+* `web/src/filters.js` is the global smoothing pass, and it runs in two places
+  for one reason: noise that has already become a bone rotation cannot be
+  removed without also lagging the pose. The reconstructed joints and the
+  auxiliary landmarks are low-passed in camera space *before* any bone is
+  solved, the root translation with them, and every bone's finished local
+  rotation once afterwards — so a bad frame is quietened on the way in and the
+  residual is quietened on the way out. Three filters share the cutoff knob: a
+  2nd-order Butterworth biquad (Q = 1/√2), One Euro, and a plain exponential.
+  Quaternions are filtered component-wise on one hemisphere and renormalised,
+  which is stable and needs no wrap-around bookkeeping. On top of the filter, a
+  deadband holds sub-threshold movement: a low-pass decays towards a still pose
+  but never quite reaches one, so the last shiver needs a floor, not a
+  smaller cutoff.
 * The preview skeleton is drawn from the worker's 2D landmarks, so no second
   pose model is running.
 

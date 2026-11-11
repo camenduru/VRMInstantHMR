@@ -44,6 +44,28 @@
 
       <section>
         <div class="field-head">
+          <span class="label">Smoothing</span>
+          <select id="filter-type" class="mini" aria-label="Smoothing filter"
+                  title="Butterworth: flat 2nd-order low-pass (default). One Euro: adaptive, steady when still and quick when moving. Exponential: plain single-pole smoothing.">
+            <option value="off">Off</option>
+            <option value="butterworth" selected>Butterworth</option>
+            <option value="oneeuro">One Euro</option>
+            <option value="exponential">Exponential</option>
+          </select>
+        </div>
+        <label class="slider" title="Cutoff of the low-pass: lower is smoother and laggier, higher follows every wobble">
+          <span class="row"><span>Smoothing</span><em id="filter-strength-meta">—</em></span>
+          <input id="filter-strength" type="range" min="0" max="100" step="1" value="55" />
+        </label>
+        <label class="slider" title="Movement smaller than this is treated as tracking noise and held, which stops the stand-still shiver a low-pass can only damp">
+          <span class="row"><span>De-jitter</span><em id="filter-deadband-meta">—</em></span>
+          <input id="filter-deadband" type="range" min="0" max="30" step="1" value="8" />
+        </label>
+        <p class="meta">Global filter · joints, root and every bone</p>
+      </section>
+
+      <section>
+        <div class="field-head">
           <span class="label">Avatar</span>
           <button id="btn-avatar" type="button" class="link">Load VRM…</button>
           <input id="avatar-input" type="file" accept=".vrm" hidden />

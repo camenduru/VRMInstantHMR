@@ -23,6 +23,11 @@ const sourceSelect = document.getElementById('source-select');
 const sourceMeta = document.getElementById('source-meta');
 const liveStats = document.getElementById('live-stats');
 const followRoot = document.getElementById('follow-root');
+const filterType = document.getElementById('filter-type');
+const filterStrength = document.getElementById('filter-strength');
+const filterDeadband = document.getElementById('filter-deadband');
+const filterStrengthMeta = document.getElementById('filter-strength-meta');
+const filterDeadbandMeta = document.getElementById('filter-deadband-meta');
 const avatarMeta = document.getElementById('avatar-meta');
 const btnLive = document.getElementById('btn-live');
 const btnUpload = document.getElementById('btn-upload');
@@ -380,6 +385,7 @@ async function loadAvatar(url, label) {
   state.retargeter = new MocapRetargeter(vrm, avatarRoot);
   state.retargeter.camera = camera;
   state.retargeter.rootFollow = followRoot.checked;
+  applySmoothing({ persist: false });
   if (vrm.lookAt) vrm.lookAt.target = camera;
   blinkExpression = vrm.expressionManager?.getExpression('blink') ?? null;
   blinkTimer = 2;
@@ -652,6 +658,72 @@ followRoot.addEventListener('change', () => {
   if (state.retargeter) state.retargeter.setRootFollow(followRoot.checked);
 });
 
+/* -------------------------------------------------------------- smoothing */
+// One global filter bank for the whole rig (see filters.js). The slider is
+// strength, not Hz: 0 barely touches the motion, 100 is a heavy low-pass that
+// floats behind the person. The mapping is geometric so the useful range of
+// the slider is spread over its whole travel instead of bunched at one end.
+const SMOOTH_STORE = 'instanthmr.smoothing';
+const FILTER_OFF = 'off';
+
+function strengthToCutoff(strength) {
+  const s = Math.min(1, Math.max(0, strength / 100));
+  return 20 * Math.pow(0.06, s);
+}
+
+function clamp01(value) {
+  return Math.min(1, Math.max(0, value));
+}
+
+/** Push the panel state into the retargeter and label the sliders. */
+function applySmoothing({ persist = true } = {}) {
+  const type = filterType.value;
+  const strength = Number(filterStrength.value) || 0;
+  const deadband = clamp01((Number(filterDeadband.value) || 0) / 30) * 3;
+  const cutoff = strengthToCutoff(strength);
+  const off = type === FILTER_OFF;
+
+  filterStrength.disabled = off;
+  filterDeadband.disabled = off;
+  filterStrengthMeta.textContent = off ? 'off' : `${cutoff.toFixed(1)} Hz`;
+  filterDeadbandMeta.textContent = off ? 'off' : `${deadband.toFixed(1)}°`;
+
+  if (state.retargeter) {
+    state.retargeter.smoothing.configure({ type, cutoff, deadband });
+  }
+
+  if (!persist) return;
+  try {
+    localStorage.setItem(SMOOTH_STORE, JSON.stringify({
+      type,
+      strength,
+      deadband: Number(filterDeadband.value) || 0,
+    }));
+  } catch {
+    /* private mode: the choice just does not survive a reload */
+  }
+}
+
+for (const el of [filterType, filterStrength, filterDeadband]) {
+  el.addEventListener('input', () => applySmoothing());
+}
+
+try {
+  const saved = JSON.parse(localStorage.getItem(SMOOTH_STORE) || 'null');
+  if (saved && typeof saved === 'object') {
+    if (typeof saved.type === 'string') filterType.value = saved.type;
+    if (Number.isFinite(saved.strength)) {
+      filterStrength.value = String(saved.strength);
+    }
+    if (Number.isFinite(saved.deadband)) {
+      filterDeadband.value = String(saved.deadband);
+    }
+  }
+} catch {
+  /* storage unavailable; keep the defaults */
+}
+applySmoothing({ persist: false });
+
 /* ------------------------------------------------- green screen / OBS wiring */
 chromaBox.addEventListener('change', () => setChroma(chromaBox.checked));
 chromaColor.addEventListener('input', () => setChromaColor(chromaColor.value));
@@ -805,7 +877,7 @@ window.addEventListener('resize', () => {
 
 window.mocap = {
   state, scene, camera, controls, avatarRoot, renderer,
-  setChroma, setChromaColor, setObsLayout,
+  setChroma, setChromaColor, setObsLayout, applySmoothing,
 };
 
 requestAnimationFrame(animate);

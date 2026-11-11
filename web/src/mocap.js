@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { mapBlendshapes } from './face-retarget.js';
+import { MotionFilter } from './filters.js';
 
 /**
  * Retargets COCO-17 keypoints from a mirrored webcam image onto a VRM
@@ -213,6 +214,23 @@ export class MocapRetargeter {
     if (!this.b.chest && this.b.upperChest) this.b.chest = this.b.upperChest;
     if (!this.b.chest) this.b.chest = this.b.spine;
 
+    // Global output smoothing (see filters.js): one filter bank over the whole
+    // rig, configured from the panel. Inert until main.js tunes it, so the
+    // retargeter behaves exactly as before with smoothing off.
+    this.smoothing = new MotionFilter();
+    // Every bone once, even when two names share a node (a rig with no
+    // `chest` aliases it to `upperChest`/`spine`; filtering the same bone
+    // twice would double its smoothing and its lag).
+    this._smoothBones = [];
+    {
+      const seen = new Set();
+      for (const [name, bone] of Object.entries(this.b)) {
+        if (!bone || seen.has(bone)) continue;
+        seen.add(bone);
+        this._smoothBones.push([name, bone]);
+      }
+    }
+
     this.smoothPx = new Float32Array(17 * 2);
     this.scores = new Float32Array(17);
     this.hasJoint = new Uint8Array(17);
@@ -266,6 +284,7 @@ export class MocapRetargeter {
     // any idle animation can overwrite the rig. See FRAME3D.
     this._frames = Object.create(null);
     this._lm3 = Object.create(null);
+    this._lmRaw = new THREE.Vector3();
     this._captureFrames();
     this._fAxis = new THREE.Vector3();
     this._fRef = new THREE.Vector3();
@@ -814,7 +833,9 @@ export class MocapRetargeter {
       clamp((0.6 - ny) * 1.2, -0.15, 0.15) * weight,
       0,
     );
+    if (this.smoothing.active) this.smoothing.vector(this._target, 'root', dt);
     this.root.position.lerp(this._target, damp(dt, TAU_ROOT));
+    this._applyOutputFilter(dt);
   }
 
   /** VRM expression names this avatar actually has, resolved once. */
@@ -1332,6 +1353,12 @@ export class MocapRetargeter {
       raw[i].set(p[0], p[1], p[2]);
     }
 
+    // Filter the reconstructed joints here, in camera space and before a
+    // single bone is solved: the shake is in the reconstruction, so low-passing
+    // it first means no bone ever sees it, instead of each limb trying to
+    // second-guess it afterwards.
+    this.smoothing.joints(raw, SMPL_BODY_JOINTS, dt);
+
     const pelvis = this._midHip.copy(raw[SMPL.leftHip])
       .add(raw[SMPL.rightHip]).multiplyScalar(0.5);
     this._midSh.copy(raw[SMPL.leftShoulder])
@@ -1362,7 +1389,12 @@ export class MocapRetargeter {
           v = new THREE.Vector3();
           this._lm3[key] = v;
         }
-        v.set(pelvis.x - p[0], pelvis.y - p[1], pelvis.z - p[2]);
+        // same treatment as the joints: these carry the roll and yaw, so a
+        // noisy landmark pair spins a bone that the joints alone would not
+        this._lmRaw.set(p[0], p[1], p[2]);
+        this.smoothing.vector(this._lmRaw, `lm:${key}`, dt);
+        v.set(pelvis.x - this._lmRaw.x, pelvis.y - this._lmRaw.y,
+          pelvis.z - this._lmRaw.z);
         v.valid = true;
       }
     }
@@ -1715,12 +1747,36 @@ export class MocapRetargeter {
     const follow = this.rootFollow ? ground : 0;
     this._target.set(x * weight * follow, y * weight,
       z * weight * follow);
+    // the root is the one translation the avatar has, so it gets the same
+    // filter as the joints: a pelvis that shivers by a centimetre shakes the
+    // whole character, feet included
+    if (this.smoothing.active) this.smoothing.vector(this._target, 'root', dt);
 
     const k = damp(dt, TAU_ROOT);
     this.root.position.x += (this._target.x - this.root.position.x) * k;
     this.root.position.z += (this._target.z - this.root.position.z) * k;
     const ky = damp(dt, TAU_ROOT_Y);
     this.root.position.y += (this._target.y - this.root.position.y) * ky;
+
+    this._applyOutputFilter(dt);
+  }
+
+  /**
+   * The global smoothing pass over the finished pose.
+   *
+   * Every bone's local rotation has been written by now (by the retargeter, or
+   * left to the idle mixer for the bones it does not drive), so filtering here
+   * smooths whatever the per-limb logic decided *and* any residual from the
+   * animation underneath. Local rotations are used rather than world ones on
+   * purpose: the parent is already smooth, so a local low-pass also passes
+   * everything the parent does without a second copy of the same lag.
+   */
+  _applyOutputFilter(dt) {
+    if (!this.smoothing.active) return;
+    for (let i = 0; i < this._smoothBones.length; i++) {
+      const entry = this._smoothBones[i];
+      this.smoothing.quaternion(entry[1].quaternion, entry[0], dt);
+    }
   }
 
   setRootFollow(on) {
@@ -1768,5 +1824,6 @@ export class MocapRetargeter {
     this.root.position.set(0, 0, 0);
     this.rootRef = null;
     this._rootDelta.set(0, 0, 0);
+    this.smoothing.reset();
   }
 }
