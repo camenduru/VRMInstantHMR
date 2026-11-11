@@ -227,6 +227,13 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
                             # have to travel with the joints
                             if pose.get('landmarks'):
                                 message['landmarks'] = pose['landmarks']
+                            # 2D joints + detector box: how much of the body is
+                            # inside the frame, which is how a close-up is told
+                            # apart from a full-body shot
+                            if pose.get('skeleton2d'):
+                                message['skeleton2d'] = pose['skeleton2d']
+                            if pose.get('box2d'):
+                                message['box2d'] = pose['box2d']
                     await ws.send_json(message)
                 await asyncio.sleep(1 / 90)
         except WebSocketDisconnect:

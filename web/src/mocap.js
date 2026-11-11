@@ -129,6 +129,18 @@ const TAU_ROOT_Y = 0.13;      // vertical follows the legs, so it tracks a bounc
 const TAU_HIP = 0.5;          // how fast the standing height may be relearned
 const TAU_TRIM = 1.2;         // how fast the feet settle onto the floor
 const ROOT_TRIM = 0.12;       // metres the ground trim may correct
+
+// Close-up shots. A camera that cuts the body at the waist leaves the
+// reconstruction no ground to stand on, and it fills the gap with a guess:
+// the pelvis drops, the thighs swing forward and the torso pitches away from
+// the camera. The 2D joints say which legs were ever in the picture, so those
+// frames are retargeted with a neutral lower body instead of the guess.
+const TAU_CROP = 0.22;        // seconds for a limb to count as in/out of shot
+const CROP_MARGIN = 0.02;     // a joint this far outside the image still counts
+const CROP_EDGE = 0.015;      // box this close to the frame edge = body cut off
+// How far a hidden arm hangs out from the ribs, as a share of the sideways
+// axis: straight down is a soldier, this is a relaxed shoulder.
+const ARM_SLACK = 0.16;
 const TAU_FACE = 0.045;      // expression weight smoothing
 const TAU_FACE_HEAD = 0.07;  // facial head pose smoothing
 const TAU_FACE_GAZE = 0.09;  // iris jitter is fast; gaze needs its own band
@@ -273,6 +285,9 @@ export class MocapRetargeter {
     this._t2 = new THREE.Vector3();
     this._t3 = new THREE.Vector3();
     this._t4 = new THREE.Vector3();
+    this._t5 = new THREE.Vector3();
+    this._t6 = new THREE.Vector3();
+    this._t7 = new THREE.Vector3();
     this._v1 = new THREE.Vector3();
     this._v2 = new THREE.Vector3();
     this._q1 = new THREE.Quaternion();
@@ -308,6 +323,29 @@ export class MocapRetargeter {
     this._personLeg = 0;
     this._trim = 0;
     this.rootRef = null;
+    // How much of each leg (person's left/right) the shot actually shows, and
+    // how far the frame as a whole is a close-up. Both are smoothed weights,
+    // so a leg that walks back into shot eases in instead of snapping.
+    this._legSeen = { left: 1, right: 1 };
+    // The same question, per arm and per segment: an arm cut by the frame is
+    // an arm the reconstruction guessed, and it guessed a shake. `upper` is
+    // shoulder-to-elbow, `lower` elbow-to-wrist.
+    this._armSeen = {
+      left: { upper: 1, lower: 1 },
+      right: { upper: 1, lower: 1 },
+    };
+    this._armOut = new THREE.Vector3();
+    this._armHang = new THREE.Vector3();
+    this._armUpper = new THREE.Vector3();
+    this._armFore = new THREE.Vector3();
+    this._armKnuck = new THREE.Vector3();
+    this._armPos = new THREE.Vector3();
+    this._armChest = new THREE.Vector3();
+    this._crop = 0;
+    this._cropUp = new THREE.Vector3();
+    this._cropTarget = new THREE.Vector3();
+    this._cropQ = new THREE.Quaternion();
+    this._cropQw = new THREE.Quaternion();
     // mid-hip displacement from the calibration point, in body axes; the root
     // motion source once joint directions are pelvis-relative
     this._rootDelta = new THREE.Vector3();
@@ -1105,6 +1143,159 @@ export class MocapRetargeter {
   }
 
   /* ------------------------------------------------------- 3D joints ---- */
+
+  /**
+   * How much of each limb the camera can actually see.
+   *
+   * A reconstruction that cannot see a limb still returns one. In a waist-up or
+   * shoulder-height shot the missing half is invented as a crouch - the pelvis
+   * drops, the thighs swing forward, the ankles float in front of the body -
+   * which is a crouching avatar with its feet in the air. The 2D joints are
+   * the receipt: InstantHMR projects the same skeleton into the submitted
+   * frame, so a joint whose projection lands outside the image was never
+   * observed. A leg counts as seen only when knee, ankle and toes are all
+   * inside; anything less is a crop, not a leg. The detector's box says the
+   * same thing from the other side, so a box that runs into the bottom edge of
+   * the frame also withholds the margin there.
+   *
+   * The arms get the same treatment, segment by segment: an arm below a
+   * waist-up shot is invented too, and unlike the legs it is invented *moving*
+   * - the elbow and wrist wander and the roll spins, which reads as the model
+   * shaking. Shoulder+elbow is the upper arm, elbow+wrist the forearm.
+   *
+   * The weights are smoothed, so a limb walking back into shot blends in rather
+   * than snapping in one frame.
+   */
+  _cropWeights(pose, dt) {
+    const screen = pose && pose.skeleton2d;
+    let seenLeft = true;
+    let seenRight = true;
+    const armSeen = {
+      left: { upper: true, lower: true },
+      right: { upper: true, lower: true },
+    };
+    if (Array.isArray(screen) && screen.length >= SMPL_BODY_JOINTS) {
+      // When the detector's box runs into the bottom edge the person really
+      // does continue past the frame, so the tolerance the margin grants at
+      // the other edges must not be granted there - a joint just outside the
+      // picture is the cut, not a rounding error.
+      const box = pose.box2d;
+      const cut = Array.isArray(box) && box.length >= 4 &&
+        box[3] >= 1 - CROP_EDGE;
+      const floor = cut ? 1 : 1 + CROP_MARGIN;
+      const inside = (i) => {
+        const q = screen[i];
+        return Array.isArray(q) && q.length >= 2 &&
+          Number.isFinite(q[0]) && Number.isFinite(q[1]) &&
+          q[0] >= -CROP_MARGIN && q[0] <= 1 + CROP_MARGIN &&
+          q[1] >= -CROP_MARGIN && q[1] <= floor;
+      };
+      const leg = (knee, ankle, toe) =>
+        inside(knee) && inside(ankle) && inside(toe);
+      seenLeft = leg(SMPL.leftKnee, SMPL.leftAnkle, SMPL.leftToe);
+      seenRight = leg(SMPL.rightKnee, SMPL.rightAnkle, SMPL.rightToe);
+      for (const side of ['left', 'right']) {
+        const shoulder = inside(SMPL[`${side}Shoulder`]);
+        const elbow = inside(SMPL[`${side}Elbow`]);
+        const wrist = inside(SMPL[`${side}Wrist`]);
+        armSeen[side].upper = shoulder && elbow;
+        armSeen[side].lower = elbow && wrist;
+      }
+    }
+    const k = damp(dt, TAU_CROP);
+    this._legSeen.left += ((seenLeft ? 1 : 0) - this._legSeen.left) * k;
+    this._legSeen.right += ((seenRight ? 1 : 0) - this._legSeen.right) * k;
+    for (const side of ['left', 'right']) {
+      const seen = this._armSeen[side];
+      seen.upper += ((armSeen[side].upper ? 1 : 0) - seen.upper) * k;
+      seen.lower += ((armSeen[side].lower ? 1 : 0) - seen.lower) * k;
+    }
+    // Close-up only when no leg at all is in shot: one visible leg still pins
+    // the camera down enough to trust the reconstruction's height and pitch.
+    const target = 1 - Math.max(this._legSeen.left, this._legSeen.right);
+    this._crop += (target - this._crop) * k;
+  }
+
+  /**
+   * Undo the pitch a close-up camera invents.
+   *
+   * Without a floor in view, InstantHMR guesses a camera looking down at the
+   * person, and the guess shows up as a constant lean away from the viewer: in
+   * a waist-up shot the shoulders sit some 40 cm behind the pelvis in depth
+   * while their 2D projection is dead vertical. The image can only ever show
+   * left-right lean, so the part of the torso axis that points into the screen
+   * is exactly the part that was invented. Dropping that component and
+   * rotating the skeleton about the pelvis by the difference stands the person
+   * up, and leaves any lean the image does show alone.
+   *
+   * This only runs while the frame is a close-up, so the real forward lean of
+   * a full-body dance is untouched.
+   */
+  _uprightCrop(dt) {
+    this._cropQw.identity();
+    if (this._crop < 0.002) {
+      // drop the filter state, so re-entering a close-up starts from the
+      // measurement instead of a stale direction from the previous shot
+      this.dirState.delete('cropUp');
+      return;
+    }
+    const up = this._cropUp.copy(this._j3[SMPL.leftShoulder])
+      .add(this._j3[SMPL.rightShoulder]).multiplyScalar(0.5);
+    if (up.lengthSq() < 1e-8) return;
+    up.normalize();
+    // one-euro, because the shoulder line is the noisiest pair in the skeleton
+    const smoothed = this.smoothDir('cropUp', up, dt);
+    this._cropTarget.set(smoothed.x, smoothed.y, 0);
+    if (this._cropTarget.lengthSq() < 1e-6) this._cropTarget.copy(smoothed);
+    this._cropTarget.normalize();
+    this._cropQ.setFromUnitVectors(smoothed, this._cropTarget);
+    this._cropQw.identity().slerp(this._cropQ, this._crop);
+    const q = this._cropQw;
+    for (let i = 0; i < SMPL_BODY_JOINTS; i++) this._j3[i].applyQuaternion(q);
+    for (const key of Object.keys(this._lm3)) {
+      const v = this._lm3[key];
+      if (v.valid) v.applyQuaternion(q);
+    }
+  }
+
+  /**
+   * A leg bone's direction, pinned to straight down when the shot hides it.
+   *
+   * `weight` is how much of the leg the camera can see (1 = all of it). At 0
+   * the measured direction - which is an invention - is replaced by the only
+   * stance a hidden leg can be in: hanging under the hip, parallel to the
+   * torso's own up axis.
+   */
+  legDir(a, b, weight, out) {
+    out.copy(this._j3[b]).sub(this._j3[a]);
+    if (out.lengthSq() < 1e-10) return out.copy(this._upBody).negate();
+    out.normalize();
+    if (weight >= 0.999) return out;
+    this._t7.copy(this._upBody).negate();
+    out.lerp(this._t7, 1 - weight);
+    if (out.lengthSq() < 1e-8) out.copy(this._t7);
+    return out.normalize();
+  }
+
+  /**
+   * An arm bone's direction, blended toward a resting pose the shot can see.
+   *
+   * `weight` is how much of that arm segment the camera can see (1 = all of
+   * it). At 0 the measured direction - which is an invention - is replaced by
+   * `rest`: the upper arm hangs under its shoulder, the forearm continues the
+   * upper arm, and the hand continues the forearm. That chain is the only arm
+   * stance a missing arm can be in, and it cannot shake.
+   */
+  armDir(a, b, weight, rest, out) {
+    out.copy(this._j3[b]).sub(this._j3[a]);
+    if (out.lengthSq() < 1e-10) return out.copy(rest);
+    out.normalize();
+    if (weight >= 0.999) return out;
+    out.lerp(rest, 1 - weight);
+    if (out.lengthSq() < 1e-8) out.copy(rest);
+    return out.normalize();
+  }
+
   /**
    * Put the person's camera-space skeleton into the avatar's world frame.
    *
@@ -1155,49 +1346,6 @@ export class MocapRetargeter {
       this._j3[i].set(pelvis.x - p.x, pelvis.y - p.y, pelvis.z - p.z);
     }
 
-    // --- centre of gravity ------------------------------------------------
-    // How high the hips ride over the foot that carries the weight. The lower
-    // ankle is the support foot, so a lifted or kicking leg never raises the
-    // body; and because both points are reconstructed in the same frame, this
-    // is independent of where the camera is and how far away the person stands.
-    {
-      const j = this._j3;
-      const support = j[SMPL.leftAnkle].y < j[SMPL.rightAnkle].y
-        ? 'left' : 'right';
-      const hipHeight = -j[SMPL[`${support}Ankle`]].y;
-      const legLen = j[SMPL[`${support}Hip`]]
-        .distanceTo(j[SMPL[`${support}Knee`]]) +
-        j[SMPL[`${support}Knee`]].distanceTo(j[SMPL[`${support}Ankle`]]);
-      if (hipHeight > 0.3 && hipHeight < 1.5 && legLen > 0.3) {
-        // hipRef is the person's own standing height: the tallest the hips get
-        // while the leg is still nearly straight, so a crouch can never become
-        // the reference and a tucked-leg jump cannot raise it either.
-        if (!this.hipRef) {
-          this.hipRef = hipHeight;
-        } else if (hipHeight > this.hipRef && hipHeight / legLen > 0.9) {
-          this.hipRef += (hipHeight - this.hipRef) * damp(dt, TAU_HIP);
-        }
-        this._hipHeight = hipHeight;
-        this._personLeg = legLen;
-      }
-    }
-
-    // Current torso axes, read off the joints and expressed in avatar space.
-    // The person's lean and turn live in these two vectors; the rest of the
-    // body is measured relative to them below.
-    const upBody = this.smoothDir('torsoUp',
-      this._up3.copy(pelvis).sub(this._midSh).normalize(), dt);
-    const sideBody = this.smoothDir('torsoSide',
-      this._side3.copy(raw[SMPL.leftShoulder])
-        .sub(raw[SMPL.rightShoulder]).normalize(), dt);
-
-    // side x up = the avatar's facing, since a reflected (x=left, y=up)
-    // frame puts forward at +Z
-    const fwd = this._fwd3.crossVectors(sideBody, upBody);
-    if (fwd.lengthSq() < 1e-8) return false;
-    fwd.normalize();
-    const right = this._right3.crossVectors(upBody, fwd).normalize();
-
     // Optional auxiliary landmarks (ears/nose, elbows, heels, knuckles) live
     // in the same camera axes as the joints; project them the same way. They
     // carry the roll and yaw a 22-joint skeleton cannot express.
@@ -1218,6 +1366,62 @@ export class MocapRetargeter {
         v.valid = true;
       }
     }
+
+    // A waist-up shot has no legs to measure, so settle that before any of the
+    // geometry below is read: the frame gate first, then the pitch correction.
+    this._cropWeights(pose, dt);
+    this._uprightCrop(dt);
+
+    // --- centre of gravity ------------------------------------------------
+    // How high the hips ride over the foot that carries the weight. The lower
+    // ankle is the support foot, so a lifted or kicking leg never raises the
+    // body; and because both points are reconstructed in the same frame, this
+    // is independent of where the camera is and how far away the person stands.
+    {
+      const j = this._j3;
+      const support = j[SMPL.leftAnkle].y < j[SMPL.rightAnkle].y
+        ? 'left' : 'right';
+      const hipHeight = -j[SMPL[`${support}Ankle`]].y;
+      const legLen = j[SMPL[`${support}Hip`]]
+        .distanceTo(j[SMPL[`${support}Knee`]]) +
+        j[SMPL[`${support}Knee`]].distanceTo(j[SMPL[`${support}Ankle`]]);
+      if (hipHeight > 0.3 && hipHeight < 1.5 && legLen > 0.3) {
+        // hipRef is the person's own standing height: the tallest the hips get
+        // while the leg is still nearly straight, so a crouch can never become
+        // the reference and a tucked-leg jump cannot raise it either.
+        //
+        // A close-up's legs are a guess, so they may not teach the reference -
+        // otherwise the invented crouch would become this person's standing
+        // height and the avatar would shrink for the rest of the shot.
+        if (this._crop < 0.5) {
+          if (!this.hipRef) {
+            this.hipRef = hipHeight;
+          } else if (hipHeight > this.hipRef && hipHeight / legLen > 0.9) {
+            this.hipRef += (hipHeight - this.hipRef) * damp(dt, TAU_HIP);
+          }
+        }
+        this._hipHeight = hipHeight;
+        this._personLeg = legLen;
+      }
+    }
+
+    // Current torso axes, read off the joints and expressed in avatar space.
+    // The person's lean and turn live in these two vectors; the rest of the
+    // body is measured relative to them below.
+    const upBody = this.smoothDir('torsoUp',
+      this._up3.copy(this._j3[SMPL.leftShoulder])
+        .add(this._j3[SMPL.rightShoulder]).multiplyScalar(0.5).normalize(), dt);
+    const sideBody = this.smoothDir('torsoSide',
+      this._side3.copy(raw[SMPL.leftShoulder])
+        .sub(raw[SMPL.rightShoulder])
+        .applyQuaternion(this._cropQw).normalize(), dt);
+
+    // side x up = the avatar's facing, since a reflected (x=left, y=up)
+    // frame puts forward at +Z
+    const fwd = this._fwd3.crossVectors(sideBody, upBody);
+    if (fwd.lengthSq() < 1e-8) return false;
+    fwd.normalize();
+    const right = this._right3.crossVectors(upBody, fwd).normalize();
 
     this._upBody.copy(upBody);
     this._fwdBody.copy(fwd);
@@ -1336,6 +1540,33 @@ export class MocapRetargeter {
       this.poseBone(`${side}Shoulder`,
         dirJ(SMPL[`${p}Collar`], SMPL[`${p}Shoulder`]), shoulderFwd, w);
 
+      // Where this arm hangs when the shot cuts it off. Read off the avatar's
+      // own bones, so it works whichever way the VRM's axes point: the upper
+      // arm root sits outboard of the chest, and the socket direction is the
+      // sideways axis this arm belongs to.
+      const armSeen = this._armSeen[p];
+      this._armOut.copy(up).negate();
+      const upperBone = this.b[`${side}UpperArm`];
+      const chestBone = this.b.chest || this.b.hips;
+      if (upperBone && chestBone) {
+        upperBone.getWorldPosition(this._armPos);
+        chestBone.getWorldPosition(this._armChest);
+        this._armOut.copy(this._armPos).sub(this._armChest);
+        this._armOut.addScaledVector(up, -this._armOut.dot(up));
+        if (this._armOut.lengthSq() > 1e-8) this._armOut.normalize();
+        else this._armOut.copy(up).negate();
+      }
+      this._armHang.copy(up).negate().addScaledVector(this._armOut, ARM_SLACK);
+      if (this._armHang.lengthSq() < 1e-8) this._armHang.copy(up).negate();
+      this._armHang.normalize();
+
+      // Segment by segment: a hidden upper arm hangs, a hidden forearm
+      // continues it, and a visible one keeps its reconstructed direction.
+      this.armDir(SMPL[`${p}Shoulder`], SMPL[`${p}Elbow`], armSeen.upper,
+        this._armHang, this._armUpper);
+      this.armDir(SMPL[`${p}Elbow`], SMPL[`${p}Wrist`], armSeen.lower,
+        this._armUpper, this._armFore);
+
       // Back of the arm: from the elbow crease to the point of the elbow.
       // This is the roll a direction-only transfer leaves to the rest pose.
       //
@@ -1345,20 +1576,19 @@ export class MocapRetargeter {
       // an elbow can never do. The perpendicular part is all that carries
       // meaning, and its share of the line is the confidence in the sample:
       // a clean sample twists the arm fully, a noisy one falls back to
-      // "back of the arm faces away from the chest" instead of shaking.
+      // "back of the arm faces away from the chest" instead of shaking. A
+      // landmark pair outside the frame is invented, so it has no say at all.
       let armBack = this._t2.copy(shoulderFwd).negate();
       const olec = this.lm(`${p}_olecranon`);
       const cub = this.lm(`${p}_cubital`);
-      const fore = this._t1.copy(j[SMPL[`${p}Wrist`]])
-        .sub(j[SMPL[`${p}Elbow`]]);
-      if (olec && cub && fore.lengthSq() > 1e-8) {
-        fore.normalize();
+      if (olec && cub) {
         const crease = this._t4.copy(olec).sub(cub);
         const total = crease.length();
         if (total > 1e-4) {
-          crease.addScaledVector(fore, -crease.dot(fore));
+          crease.addScaledVector(this._armFore, -crease.dot(this._armFore));
           const perp = crease.length();
-          const trust = clamp((perp / total - 0.3) / 0.45, 0, 1);
+          const trust = clamp((perp / total - 0.3) / 0.45, 0, 1) *
+            armSeen.upper * armSeen.lower;
           if (perp > 1e-4 && trust > 0.001) {
             crease.normalize();
             armBack.lerp(
@@ -1367,27 +1597,40 @@ export class MocapRetargeter {
         }
       }
 
-      this.poseBone(`${side}UpperArm`,
-        dirJ(SMPL[`${p}Shoulder`], SMPL[`${p}Elbow`]), armBack, w);
-      this.poseBone(`${side}LowerArm`,
-        dirJ(SMPL[`${p}Elbow`], SMPL[`${p}Wrist`]), armBack, w);
+      this.poseBone(`${side}UpperArm`, this._armUpper, armBack, w);
+      this.poseBone(`${side}LowerArm`, this._armFore, armBack, w);
 
-      // Hand: the wrist -> middle knuckle direction transfers wrist flex;
-      // the roll follows the forearm. The rig keeps following the forearm
-      // when the worker sends no hand landmarks.
+      // Hand: the wrist -> middle knuckle direction transfers wrist flex; the
+      // roll follows the forearm. A wrist outside the frame has no knuckle to
+      // read, so the hand simply continues the forearm.
+      this._armKnuck.copy(this._armFore);
       const knuckle = this.lm(`${p}_middle`);
       if (knuckle) {
-        this._t4.copy(knuckle).sub(j[SMPL[`${p}Wrist`]]);
-        if (this._t4.lengthSq() > 1e-8) {
-          this.poseBone(`${side}Hand`, this._t4, armBack, w);
+        this._armKnuck.copy(knuckle).sub(j[SMPL[`${p}Wrist`]]);
+        if (this._armKnuck.lengthSq() > 1e-8) {
+          this._armKnuck.normalize()
+            .lerp(this._armFore, 1 - armSeen.lower);
+          if (this._armKnuck.lengthSq() < 1e-8) {
+            this._armKnuck.copy(this._armFore);
+          }
+        } else {
+          this._armKnuck.copy(this._armFore);
         }
       }
+      this.poseBone(`${side}Hand`, this._armKnuck, armBack, w);
 
-      // Legs: the front of the thigh and shin follows the torso.
+      // Legs: the front of the thigh and shin follows the torso. A leg the
+      // camera cannot see is a leg the reconstruction invented, and it invents
+      // a crouch; a hidden leg standing straight under its hip is both the
+      // likelier truth and the only stance that cannot leave the avatar folded
+      // in mid air with its feet off the floor.
+      const legW = this._legSeen[p];
       this.poseBone(`${side}UpperLeg`,
-        dirJ(SMPL[`${p}Hip`], SMPL[`${p}Knee`]), shoulderFwd, w);
+        this.legDir(SMPL[`${p}Hip`], SMPL[`${p}Knee`], legW, this._t5),
+        shoulderFwd, w);
       this.poseBone(`${side}LowerLeg`,
-        dirJ(SMPL[`${p}Knee`], SMPL[`${p}Ankle`]), shoulderFwd, w);
+        this.legDir(SMPL[`${p}Knee`], SMPL[`${p}Ankle`], legW, this._t6),
+        shoulderFwd, w);
 
       // Foot: ankle, toe and heel form a triangle whose lateral normal, crossed
       // with the sole line, gives the sole's upward normal (foot roll).
@@ -1409,8 +1652,19 @@ export class MocapRetargeter {
           }
         }
       }
-      this.poseBone(`${side}Foot`,
-        dirJ(SMPL[`${p}Ankle`], SMPL[`${p}Toe`]), footUp, w);
+      // A cropped leg's ankle/toe/heel triangle is invented too, so the sole
+      // falls back to flat-forward instead of following a heel that is not
+      // there.
+      if (legW < 0.999) footUp.lerp(up, 1 - legW).normalize();
+      this._t5.copy(j[SMPL[`${p}Toe`]]).sub(j[SMPL[`${p}Ankle`]]);
+      if (this._t5.lengthSq() < 1e-10) this._t5.copy(shoulderFwd);
+      this._t5.normalize();
+      if (legW < 0.999) {
+        this._t5.lerp(shoulderFwd, 1 - legW);
+        if (this._t5.lengthSq() < 1e-8) this._t5.copy(shoulderFwd);
+        this._t5.normalize();
+      }
+      this.poseBone(`${side}Foot`, this._t5, footUp, w);
     }
 
     // --- root translation -------------------------------------------------
@@ -1422,6 +1676,8 @@ export class MocapRetargeter {
     // exactly as much as the legs fold, scaled to this avatar's leg.
     const scale = clamp(this.rest.torso / Math.max(0.05, this._personTorso),
       0.4, 1.6);
+    // 1 while the legs are measured, 0 in a close-up where they are pinned
+    const ground = 1 - this._crop;
     let x = this._rootDelta.x * scale;
     let z = this._rootDelta.z * scale;
     const radius = Math.hypot(x, z);
@@ -1448,11 +1704,15 @@ export class MocapRetargeter {
         this.b.leftFoot.getWorldPosition(this._v1).y,
         this.b.rightFoot.getWorldPosition(this._v2).y);
       const err = footY - this.rest.ankle;
-      this._trim = clamp(this._trim - err * damp(dt, TAU_TRIM),
+      this._trim = clamp(this._trim - err * damp(dt, TAU_TRIM) * ground,
         -ROOT_TRIM, ROOT_TRIM);
       y += this._trim;
     }
-    const follow = this.rootFollow ? 1 : 0;
+    // In a close-up there is no measured height to follow and no measured
+    // travel to walk: the legs are pinned, so keep the avatar at its standing
+    // height and on its mark instead of following the invented crouch.
+    y *= ground;
+    const follow = this.rootFollow ? ground : 0;
     this._target.set(x * weight * follow, y * weight,
       z * weight * follow);
 
@@ -1484,6 +1744,14 @@ export class MocapRetargeter {
     this._hipHeight = 0;
     this._personLeg = 0;
     this._trim = 0;
+    this._legSeen.left = 1;
+    this._legSeen.right = 1;
+    for (const side of ['left', 'right']) {
+      this._armSeen[side].upper = 1;
+      this._armSeen[side].lower = 1;
+    }
+    this._crop = 0;
+    this._cropQw.identity();
     this.facing = 1;
     this.head.roll = 0;
     this.head.yaw = 0;

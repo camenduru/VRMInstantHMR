@@ -148,6 +148,31 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   movement** checkbox and is confined to a small cone around the spot where
   tracking began, so reconstruction depth noise can never walk the avatar off
   its mark.
+* **Close-ups and shoulder-height shots** are handled separately, because a
+  camera that cuts the body at the waist leaves the reconstruction no legs and
+  no floor. It fills the gap with a guess — hips dropped, thighs swung forward,
+  torso pitched away from the viewer — which used to retarget as a crouching
+  avatar whose feet hovered in mid air, however upright the person actually
+  was. The worker already sends the 2D projection of every joint, so the page
+  can tell what the camera really saw: a leg whose knee, ankle and toes all
+  project outside the image was never observed. Such a leg is blended to a
+  neutral straight stance under its hip and the root stays at standing height,
+  and the invented depth pitch of the torso is removed by rotating the
+  skeleton about the pelvis until the shoulder line is upright in the image
+  (left-right lean, which the image *can* show, is kept). The weights are
+  smoothed, so a leg walking back into shot takes over again over a fraction of
+  a second. Nothing of this runs while both feet are in frame, so a full-body
+  dance keeps its real lean and crouches.
+* **Arms cut by the frame** get the same treatment, segment by segment. A
+  waist-up shot also hides the arms, and the reconstruction does not leave them
+  out — it invents an elbow and a wrist that wander from frame to frame, which
+  reads as the model's arms shaking. Shoulder + elbow must both project inside
+  the image for an upper arm to count, elbow + wrist for a forearm; a hidden
+  upper arm is blended to a relaxed hang under its own shoulder, a hidden
+  forearm continues the upper arm, and the hand continues the forearm. The
+  elbow-crease landmarks that carry the arm's roll are also ignored when the
+  arm they belong to is not in shot, so the roll cannot spin either. Unlike the
+  legs, this is per arm: one arm in frame is trusted while the other hangs.
 * The preview skeleton is drawn from the worker's 2D landmarks, so no second
   pose model is running.
 

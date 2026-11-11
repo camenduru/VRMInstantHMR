@@ -170,7 +170,8 @@ def _():
     live._inflight = 1
     live._handle({'seq': 1, 'detected': True, 'ms': 1.0, 'w': 640,
                   'h': 360, 'joints': t_pose().tolist(),
-                  'joints2d': joints2d.tolist()})
+                  'joints2d': joints2d.tolist(),
+                  'box': [64.0, 72.0, 576.0, 288.0]})
     pose = live.pose()
     assert pose['detected'] is True
     assert pose['joints3d'] == np.round(
@@ -178,6 +179,9 @@ def _():
     skeleton = np.asarray(pose['skeleton2d'])
     assert skeleton.shape == (22, 2), skeleton.shape
     assert np.allclose(skeleton, 0.5, atol=1e-4), skeleton[:3]
+    box = np.asarray(pose['box2d'])
+    assert box.shape == (4,), box.shape
+    assert np.allclose(box, (0.1, 0.2, 0.9, 0.8), atol=1e-4), box
     assert live._inflight == 0, 'the reply frees the pipe for the next frame'
     assert live.status()['frames'] == 1
 
@@ -186,6 +190,7 @@ def _():
     assert pose['detected'] is False
     assert 'joints3d' not in pose, 'a miss must not publish stale joints'
     assert 'skeleton2d' not in pose
+    assert 'box2d' not in pose
 
 
 @check('a worker that dies while loading reports the failure instead of hanging')
@@ -283,6 +288,8 @@ def _():
             'seq': 3, 'detected': True, 'fps': 12.0, 'latency': 20.0,
             'joints3d': live_mod.mhr_to_smpl(points).round(4).tolist(),
             'landmarks': live_mod.mhr_landmarks(points),
+            'skeleton2d': np.full((22, 2), 0.5, np.float32).tolist(),
+            'box2d': [0.1, 0.2, 0.9, 0.8],
         }
         with TestClient(app) as client:
             with client.websocket_connect('/ws/pose') as ws:
@@ -292,6 +299,10 @@ def _():
                 assert message['joints3d'], 'the avatar needs the joints'
                 assert message['landmarks'], \
                     'without the landmarks the bones get no roll'
+                assert len(message['skeleton2d']) == 22, \
+                    'the frame crop is judged from the 2D joints'
+                assert message['box2d'] == [0.1, 0.2, 0.9, 0.8], \
+                    'the box tells the retargeter where the frame cuts the body'
 
 
 @check('the HTTP surface serves status, sources and the avatar')
@@ -336,6 +347,27 @@ def _():
             assert 'id="chroma-color"' in html, 'no custom key colour'
             assert '/assets/index-' in html and '.js' in html, \
                 'the page is not the built bundle'
+
+
+@check('a waist-up shot pins the legs instead of crouching the avatar')
+def _():
+    from fastapi.testclient import TestClient
+    from app.server import create_app
+
+    with tempfile.TemporaryDirectory() as tmp:
+        capture = Capture([Path(tmp)])
+        live = live_mod.LiveInstantHMR()
+        app = create_app(capture, live, start_live=False)
+        with TestClient(app) as client:
+            html = client.get('/').text
+            ref = html.split('/assets/')[1].split('"')[0]
+            js = client.get(f'/assets/{ref}').text
+            assert '_cropWeights' in js, \
+                'the bundle predates the close-up leg gate'
+            assert '_legSeen' in js, \
+                'nothing carries the per-leg visibility into the retargeter'
+            assert '_armSeen' in js, \
+                'nothing carries the per-arm visibility into the retargeter'
 
 
 print('\n'.join(results))

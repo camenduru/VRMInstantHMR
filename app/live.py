@@ -421,10 +421,19 @@ class LiveInstantHMR:
                 screen = mhr_to_smpl(np.asarray(message.get('joints2d'),
                                                 np.float32)) \
                     if message.get('joints2d') else None
+                size = sent[1] if sent is not None else (640, 360)
                 if screen is not None:
-                    size = sent[1] if sent is not None else (640, 360)
                     pose['skeleton2d'] = np.round(
                         screen / np.asarray(size, np.float32), 4).tolist()
+                # detector box in normalised coordinates: whether the feet are
+                # inside the shot is the only clue that a close-up crop has
+                # hallucinated legs, and the box bottom shows where the frame
+                # cuts the body
+                box = message.get('box')
+                if box:
+                    box = np.asarray(box, np.float32) / np.asarray(
+                        (size[0], size[1], size[0], size[1]), np.float32)
+                    pose['box2d'] = np.round(box, 4).tolist()
             self._pose = pose
             self._cond.notify_all()
 
