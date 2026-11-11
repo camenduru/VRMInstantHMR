@@ -24,6 +24,7 @@ const sourceSelect = document.getElementById('source-select');
 const sourceMeta = document.getElementById('source-meta');
 const liveStats = document.getElementById('live-stats');
 const followRoot = document.getElementById('follow-root');
+const footLockInput = document.getElementById('foot-lock');
 const filterType = document.getElementById('filter-type');
 const filterStrength = document.getElementById('filter-strength');
 const filterDeadband = document.getElementById('filter-deadband');
@@ -386,6 +387,7 @@ async function loadAvatar(url, label) {
   state.retargeter = new MocapRetargeter(vrm, avatarRoot);
   state.retargeter.camera = camera;
   state.retargeter.rootFollow = followRoot.checked;
+  applyFootLock({ persist: false });
   applySmoothing({ persist: false });
   if (vrm.lookAt) vrm.lookAt.target = camera;
   blinkExpression = vrm.expressionManager?.getExpression('blink') ?? null;
@@ -658,6 +660,24 @@ btnLive.addEventListener('click', () => {
 followRoot.addEventListener('change', () => {
   if (state.retargeter) state.retargeter.setRootFollow(followRoot.checked);
 });
+
+/* --------------------------------------------------------------- foot lock */
+// The choice is remembered, like the smoothing and the chroma key: a stream
+// should not need the box ticking again after a reload.
+const FOOT_LOCK_KEY = 'instanthmr.footlock';
+
+function applyFootLock({ persist = true } = {}) {
+  const on = footLockInput.checked;
+  if (state.retargeter) state.retargeter.footLock.enabled = on;
+  if (persist) localStorage.setItem(FOOT_LOCK_KEY, on ? '1' : '0');
+}
+
+footLockInput.addEventListener('change', () => applyFootLock());
+
+{
+  const stored = localStorage.getItem(FOOT_LOCK_KEY);
+  if (stored !== null) footLockInput.checked = stored === '1';
+}
 
 /* -------------------------------------------------------------- smoothing */
 // One global filter bank for the whole rig (see filters.js). The slider is

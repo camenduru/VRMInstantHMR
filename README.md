@@ -69,7 +69,9 @@ Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
 * **InstantHMR 3D** – starts/stops the live worker; the button shows the
   measured rate once it is running. **Follow movement** is off by default so
   the avatar dances on its mark; enable it to let the avatar step with the
-  person, bounded to a small cone.
+  person, bounded to a small cone. **Stick feet to floor** keeps a planted
+  foot from floating or sliding (see [Filters](#filters) for the smoothing
+  that runs alongside it).
 * **Smoothing** – one global filter bank over the whole rig, built from the
   real-time methods of the reference projects in `filters/` (see
   [Filters](#filters)): **Butterworth**, **One Euro**, **Exponential**,
@@ -194,6 +196,28 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   deadband holds sub-threshold movement: a low-pass decays towards a still pose
   but never quite reaches one, so the last shiver needs a floor, not a
   smaller cutoff.
+* `web/src/footlock.js` is the foot plant, and it takes its structure from the
+  `feet/` reference projects: contact is detected first, then held.
+  `UnderPressure` labels a foot from its height over the ground *and* its
+  speed - height alone catches a foot mid-step, speed alone catches a foot
+  parked in mid air - with hysteresis so it cannot flicker; FootMR cancels the
+  displacement of the joints it believes are static and drops the sequence
+  onto its lowest point. Here, while a foot is down and slow, the root gets an
+  offset that keeps that foot's height on the floor and cancels its sideways
+  slide, with the hold point following the foot over a third of a second so a
+  real step is not fought. The offset is an integrator with clamps, so it can
+  hold a plant against a steady error without winding up, and it leaks back to
+  zero as soon as both feet leave the ground - a jump is never pulled down.
+  **Stick feet to floor** in the panel switches it off, and the choice is
+  remembered.
+* Grounding is on the **soles**, not on the ankle bones. An ankle is not a
+  sole: point the toes and the ankle rises while the shoe goes through the
+  floor, and every bone still reports a sensible height — which is what "the
+  mesh sinks but the bones are fine" looks like. `mapSoles()` samples the
+  avatar's skin once, in its bind pose, keeps the lowest vertices per foot
+  (attached to the foot and toe bones) and the trim then holds those probes on
+  the floor the skin sat on at bind. Ankle pitch, heel lift and pointed toes
+  are all in the measurement instead of being ignored.
 * The preview skeleton is drawn from the worker's 2D landmarks, so no second
   pose model is running.
 

@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { mapBlendshapes } from './face-retarget.js';
 import { MotionFilter } from './filters.js';
+import { FootLock } from './footlock.js';
+import { floorTargetY, FLOOR_TAU } from './grounding.js';
 
 /**
  * Retargets COCO-17 keypoints from a mirrored webcam image onto a VRM
@@ -231,8 +233,7 @@ export class MocapRetargeter {
       }
     }
 
-    this.smoothPx = new Float32Array(17 * 2);
-    this.scores = new Float32Array(17);
+    this.smoothPx = new Float32Array(17 * 2);    this.scores = new Float32Array(17);
     this.hasJoint = new Uint8Array(17);
     this.blend = 0;
     this.head = { yaw: 0, roll: 0 };
@@ -279,6 +280,12 @@ export class MocapRetargeter {
       ? this.b.head.quaternion.clone()
       : null;
     this.rest = this.measure();
+    // The soles, not the ankle bones, are what touches the floor: mapSoles()
+    // picks the lowest skin points per foot while the avatar is still in its
+    // bind pose, which is the only moment the skin and the bones agree.
+    this.rest.sole = this.mapSoles();
+    this._ankleDrop = Math.max(0,
+      (this.rest.ankle ?? this.rest.sole) - this.rest.sole);
     // Full-orientation transfer: each bone's rest frame (primary axis toward
     // its child, plus an anatomical roll reference) is captured once, before
     // any idle animation can overwrite the rig. See FRAME3D.
@@ -316,6 +323,13 @@ export class MocapRetargeter {
     this._before = new THREE.Quaternion();
     this._headTarget = new THREE.Quaternion();
     this._target = new THREE.Vector3();
+    this._soleA = new THREE.Vector3();
+    this._soleB = new THREE.Vector3();
+    this._soleTmp = new THREE.Vector3();
+    // Foot planting (footlock.js): a root offset that holds a planted foot on
+    // the floor. main.js can switch it off from the panel.
+    this.footLock = new FootLock();
+    this._lockCorrection = new THREE.Vector3();
     this._eyePos = new THREE.Vector3();
     this._eyeA = new THREE.Vector3();
     this._eyeB = new THREE.Vector3();
@@ -501,14 +515,140 @@ export class MocapRetargeter {
         // to keep when the person's own legs are straight and the root has to
         // drop by exactly as much as the legs fold
         leg: upperLeg + lowerLeg,
-        // bind-pose ankle height: the height the ankle has to stay at, so the
-        // sole stays on the floor whatever the pose does above it
+        // bind-pose ankle height, kept as the fallback reference for rigs
+        // whose skin could not be scanned; the trim itself grounds on the
+        // soles (mapSoles), because an ankle is not a sole
         ankle: Math.min(p(this.b.leftFoot).y, p(this.b.rightFoot).y),
       };
     } catch (err) {
       console.warn('[mocap] could not measure avatar, using defaults', err);
       return fallback;
     }
+  }
+
+  /**
+   * The avatar's soles, as probe points on the foot bones.
+   *
+   * Grounding on the ankle bone is what lets the model sink: an ankle is not a
+   * sole. Point the toes and the ankle rises while the shoe goes through the
+   * floor, and the bones still report a perfectly sensible height - which is
+   * exactly the "the mesh sinks but the bones are fine" symptom. The lowest
+   * skin vertices at bind do follow the foot, so a handful of them per foot
+   * gives the real contact height under any ankle pitch.
+   *
+   * Returns the bind-pose sole height: the ground the trim holds the skin on.
+   */
+  mapSoles() {
+    this._soleSides = { left: [], right: [] };
+    const groups = [
+      { side: 'left', bone: this.b.leftFoot },
+      { side: 'left', bone: this.b.leftToes },
+      { side: 'right', bone: this.b.rightFoot },
+      { side: 'right', bone: this.b.rightToes },
+    ].filter((g) => g.bone);
+    if (!groups.length) return this.rest.ankle ?? 0;
+
+    this.vrm.scene.updateMatrixWorld(true);
+    const v = new THREE.Vector3();
+    const found = [];
+    let low = Infinity;
+    this.vrm.scene.traverse((object) => {
+      if (!object.isMesh || !object.geometry) return;
+      const pos = object.geometry.attributes &&
+        object.geometry.attributes.position;
+      if (!pos) return;
+      const step = Math.max(1, Math.floor(pos.count / 4000));
+      for (let i = 0; i < pos.count; i += step) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(object.matrixWorld);
+        if (v.y < low) low = v.y;
+        found.push(v.x, v.y, v.z);
+      }
+    });
+    if (!found.length || !Number.isFinite(low)) return this.rest.ankle ?? 0;
+
+    // Only the skin near the floor can touch it; anything above is a shin.
+    const near = low + 0.035;
+    const anchors = groups.map((g) =>
+      g.bone.getWorldPosition(new THREE.Vector3()));
+    const kept = groups.map(() => []);
+    for (let i = 0; i < found.length; i += 3) {
+      const y = found[i + 1];
+      if (y > near) continue;
+      v.set(found[i], y, found[i + 2]);
+      let best = 0;
+      let bestD = Infinity;
+      for (let g = 0; g < groups.length; g++) {
+        const d = anchors[g].distanceToSquared(v);
+        if (d < bestD) {
+          bestD = d;
+          best = g;
+        }
+      }
+      kept[best].push(v.x, y, v.z);
+    }
+
+    // Keep the sole OUTLINE, not just its lowest few vertices. The lowest
+    // eight bind vertices all sit in one spot near the middle of the shoe;
+    // pitch the ankle and a heel or toe edge that was 2 cm higher at bind
+    // becomes the lowest point, and a sample that only knows the middle
+    // reports the foot as grounded while the mesh is through the floor.
+    // One lowest vertex per small XZ cell covers the whole outline.
+    for (let g = 0; g < groups.length; g++) {
+      const list = kept[g];
+      if (!list.length) continue;
+      let cell = 0.02;
+      let buckets;
+      for (;;) {
+        buckets = new Map();
+        for (let i = 0; i < list.length; i += 3) {
+          const x = list[i], y = list[i + 1], z = list[i + 2];
+          const key = `${Math.floor(x / cell)},${Math.floor(z / cell)}`;
+          const prev = buckets.get(key);
+          if (!prev || y < prev[1]) buckets.set(key, [x, y, z]);
+        }
+        if (buckets.size <= 160 || cell > 0.2) break;
+        cell *= 1.5;
+      }
+      const points = [];
+      for (const [x, y, z] of buckets.values()) {
+        points.push(groups[g].bone.worldToLocal(
+          new THREE.Vector3(x, y, z)));
+      }
+      this._soleSides[groups[g].side].push({ bone: groups[g].bone, points });
+    }
+    return low;
+  }
+
+  /**
+   * The world position of the lowest skin point of one foot (see mapSoles),
+   * or the ankle dropped to the sole when the scan found nothing to probe.
+   */
+  solePoint(side, out) {
+    const groups = this._soleSides && this._soleSides[side];
+    let bestY = Infinity;
+    if (groups && groups.length) {
+      for (let g = 0; g < groups.length; g++) {
+        const { bone, points } = groups[g];
+        if (!bone || !points.length) continue;
+        bone.updateWorldMatrix(true, false);
+        for (let i = 0; i < points.length; i++) {
+          this._soleTmp.copy(points[i]).applyMatrix4(bone.matrixWorld);
+          if (this._soleTmp.y < bestY) {
+            bestY = this._soleTmp.y;
+            out.copy(this._soleTmp);
+          }
+        }
+      }
+    }
+    if (Number.isFinite(bestY)) return out;
+    const bone = this.b[`${side}Foot`];
+    if (!bone) {
+      out.set(0, 0, 0);
+      return out;
+    }
+    bone.getWorldPosition(out);
+    out.y -= this._ankleDrop || 0;
+    return out;
   }
 
   ingest(keypoints, scores, width, height, dt) {
@@ -833,9 +973,16 @@ export class MocapRetargeter {
       clamp((0.6 - ny) * 1.2, -0.15, 0.15) * weight,
       0,
     );
+    this._target.add(this._footPlant(dt, weight, 1));
     if (this.smoothing.active) this.smoothing.vector(this._target, 'root', dt);
+    const floor = this._floorSample(1);
+    if (floor.on) {
+      this._target.y = floorTargetY(this._target.y, floor.rootY, floor.soleY,
+        this.rest.sole, floor.ground).y;
+    }
     this.root.position.lerp(this._target, damp(dt, TAU_ROOT));
     this._applyOutputFilter(dt);
+    this._floorClamp(this._floorSample(1));
   }
 
   /** VRM expression names this avatar actually has, resolved once. */
@@ -1731,11 +1878,13 @@ export class MocapRetargeter {
     // posed at this point, so their world height is the ground truth: if the
     // support ankle hangs above its bind height, sink the root until it does
     // not. Slow enough that a jump or a bounce never fights it.
-    if (this.rest.ankle !== undefined) {
-      const footY = Math.min(
-        this.b.leftFoot.getWorldPosition(this._v1).y,
-        this.b.rightFoot.getWorldPosition(this._v2).y);
-      const err = footY - this.rest.ankle;
+    if (this.rest.sole !== undefined) {
+      // The skin, not the ankle: a pointed toe raises the ankle but drops the
+      // sole, and it is the sole that must stay on the floor.
+      const soleY = Math.min(
+        this.solePoint('left', this._soleA).y,
+        this.solePoint('right', this._soleB).y);
+      const err = soleY - this.rest.sole;
       this._trim = clamp(this._trim - err * damp(dt, TAU_TRIM) * ground,
         -ROOT_TRIM, ROOT_TRIM);
       y += this._trim;
@@ -1747,18 +1896,88 @@ export class MocapRetargeter {
     const follow = this.rootFollow ? ground : 0;
     this._target.set(x * weight * follow, y * weight,
       z * weight * follow);
+    this._target.add(this._footPlant(dt, weight, ground));
     // the root is the one translation the avatar has, so it gets the same
     // filter as the joints: a pelvis that shivers by a centimetre shakes the
     // whole character, feet included
     if (this.smoothing.active) this.smoothing.vector(this._target, 'root', dt);
 
+    // Hard, one-sided floor solve. The crouch term above is feed-forward from
+    // the person's hip height, but these legs are aimed by direction with fixed
+    // bone lengths, so the two disagree by centimetres on a fast step. The slow
+    // trim and the foot lock are integrators: they wind up, clamp, and arrive a
+    // second late - which is exactly how the soles ended up 9 cm under the
+    // floor. The posed soles are ground truth, so clamp the target after
+    // smoothing (otherwise the filter drags it back down) and recover quickly.
+    const floor = this._floorSample(ground);
+    let floored = false;
+    if (floor.on) {
+      const fit = floorTargetY(this._target.y, floor.rootY, floor.soleY,
+        this.rest.sole, floor.ground);
+      this._target.y = fit.y;
+      floored = fit.floored;
+    }
+
     const k = damp(dt, TAU_ROOT);
     this.root.position.x += (this._target.x - this.root.position.x) * k;
     this.root.position.z += (this._target.z - this.root.position.z) * k;
-    const ky = damp(dt, TAU_ROOT_Y);
+    const ky = damp(dt, floored ? FLOOR_TAU : TAU_ROOT_Y);
     this.root.position.y += (this._target.y - this.root.position.y) * ky;
 
+    // The output filter rewrites leg rotations, which can drop a sole by a
+    // centimetre or two AFTER the target was solved. Re-measure on the final
+    // pose and constrain the root once more - this is the last write before
+    // vrm.update() skins the mesh, so it is the height the viewer actually sees.
     this._applyOutputFilter(dt);
+    this._floorClamp(this._floorSample(ground));
+  }
+
+  /**
+   * One sample of the posed soles, taken wherever the floor is enforced.
+   * Uses a reusable scratch record: the 3D path samples twice per frame (once
+   * before the root is written, once after the output filter), and neither
+   * sample allocates.
+   *
+   * `solePoint()` refreshes the bone world matrices, so `soleY` is measured
+   * with the root still at `rootY`. Moving the root by d moves every sole by
+   * d, which makes `rootY - (soleY - rest.sole)` an absolute height that does
+   * not depend on where the root currently is. That is what lets grounding.js
+   * solve the floor instead of integrating towards it.
+   */
+  _floorSample(ground) {
+    const f = this._floorScratch || (this._floorScratch = {});
+    f.on = this.rest.sole !== undefined && ground > 0.001;
+    if (!f.on) return f;
+    f.rootY = this.root.position.y;
+    f.soleY = Math.min(
+      this.solePoint('left', this._soleA).y,
+      this.solePoint('right', this._soleB).y);
+    f.ground = ground;
+    return f;
+  }
+
+  /** The final one-sided constraint on the root position actually written. */
+  _floorClamp(f) {
+    if (!f || !f.on) return;
+    this.root.position.y = floorTargetY(this.root.position.y, f.rootY,
+      f.soleY, this.rest.sole, f.ground).y;
+  }
+
+  /**
+   * The root offset that keeps a planted foot on the floor (footlock.js).
+   *
+   * The feet have been posed by now, so their world height is the measurement:
+   * an ankle riding above its bind height means the sole is off the floor.
+   * Returns the shared correction vector, zero when the pass is off.
+   */
+  _footPlant(dt, weight, ground) {
+    const c = this._lockCorrection;
+    c.set(0, 0, 0);
+    if (!this.footLock.enabled || this.rest.sole === undefined) return c;
+    if (!this.b.leftFoot || !this.b.rightFoot) return c;
+    const left = this.solePoint('left', this._soleA);
+    const right = this.solePoint('right', this._soleB);
+    return this.footLock.solve(left, right, this.rest.sole, dt, weight * ground);
   }
 
   /**
@@ -1825,5 +2044,6 @@ export class MocapRetargeter {
     this.rootRef = null;
     this._rootDelta.set(0, 0, 0);
     this.smoothing.reset();
+    this.footLock.reset();
   }
 }
