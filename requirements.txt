@@ -1,0 +1,7 @@
+# Web server for the standalone InstantHMR -> VRM live app.
+# The launcher prefers the parent repository's .venv when present; use these
+# with any other Python 3.10+ environment.
+fastapi>=0.110
+uvicorn>=0.27
+numpy>=1.26
+opencv-python>=4.9

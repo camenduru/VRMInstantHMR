@@ -1,0 +1,8 @@
+web/node_modules/
+web/dist/
+web/.vite/
+__pycache__/
+*.py[cod]
+
+# the idle animation is part of the app; the root .gitignore drops *.vrma
+!vrm_models/*.vrma

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InstantHMR · VRM live</title>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        InstantHMR <span class="sub">VRM live</span>
+      </div>
+      <div id="status-pill" class="pill">
+        <span id="status-dot" class="pill-dot"></span>
+        <span id="status-text">starting</span>
+      </div>
+    </header>
+
+    <aside class="panel">
+      <section>
+        <div class="field-head">
+          <label for="source-select">Input</label>
+          <button id="btn-upload" type="button" class="link">Add video…</button>
+          <input id="file-input" type="file" accept="video/*" hidden />
+        </div>
+        <select id="source-select" aria-label="Video or camera input"></select>
+        <p id="source-meta" class="meta">—</p>
+      </section>
+
+      <section>
+        <div class="field-head">
+          <span class="label">InstantHMR 3D</span>
+          <button id="btn-live" type="button" class="toggle">3D live off</button>
+        </div>
+        <p id="live-stats" class="meta">not running</p>
+        <label class="check" title="Let the avatar step around the floor with the person (bounded to a small cone). Off keeps it on its mark. Height always follows the person's hips, crouch included.">
+          <input id="follow-root" type="checkbox" />
+          <span>Follow movement</span>
+        </label>
+      </section>
+
+      <section>
+        <div class="field-head">
+          <span class="label">Avatar</span>
+          <button id="btn-avatar" type="button" class="link">Load VRM…</button>
+          <input id="avatar-input" type="file" accept=".vrm" hidden />
+        </div>
+        <p id="avatar-meta" class="meta">—</p>
+      </section>
+
+      <p class="hint">
+        Pick a video or a camera. The avatar follows the reconstructed 3D body
+        in real time; drag to orbit, right-drag to pan, wheel to zoom.
+      </p>
+    </aside>
+
+    <figure class="feed">
+      <img id="feed" alt="Input preview with the live 3D skeleton" />
+      <figcaption><span id="feed-meta">input</span></figcaption>
+    </figure>
+
+    <div id="loader" class="loader">
+      <div class="spinner"></div>
+      <p id="loader-text">Loading avatar…</p>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
