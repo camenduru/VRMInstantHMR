@@ -402,12 +402,6 @@ input[type="color"]::-moz-color-swatch {
   box-shadow: none;
 }
 
-select.mini {
-  width: auto;
-  padding: 6px 8px;
-  font-size: 12px;
-}
-
 /* -------------------------------------------------------------------- feed */
 .feed {
   position: fixed;

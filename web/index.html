@@ -45,15 +45,27 @@
       <section>
         <div class="field-head">
           <span class="label">Smoothing</span>
-          <select id="filter-type" class="mini" aria-label="Smoothing filter"
-                  title="Butterworth: flat 2nd-order low-pass (default). One Euro: adaptive, steady when still and quick when moving. Exponential: plain single-pole smoothing.">
-            <option value="off">Off</option>
-            <option value="butterworth" selected>Butterworth</option>
-            <option value="oneeuro">One Euro</option>
-            <option value="exponential">Exponential</option>
-          </select>
+          <span class="meta">one filter, whole rig</span>
         </div>
-        <label class="slider" title="Cutoff of the low-pass: lower is smoother and laggier, higher follows every wobble">
+        <select id="filter-type" aria-label="Smoothing filter"
+                title="One filter over the whole rig: joints, landmarks, root and every bone">
+          <option value="off">Off</option>
+          <optgroup label="Low-pass">
+            <option value="butterworth" selected>Butterworth (2nd order)</option>
+            <option value="oneeuro">One Euro (adaptive)</option>
+            <option value="exponential">Exponential</option>
+          </optgroup>
+          <optgroup label="Windowed">
+            <option value="sma">Moving average</option>
+            <option value="wma">Weighted average</option>
+          </optgroup>
+          <optgroup label="Prediction">
+            <option value="hde">HDE (trend)</option>
+            <option value="kalman">Kalman (velocity)</option>
+            <option value="adaptiveKalman">Kalman (adaptive)</option>
+          </optgroup>
+        </select>
+        <label class="slider" title="Cutoff of the low-pass (or the window length of the averaging methods): lower is smoother and laggier, higher follows every wobble">
           <span class="row"><span>Smoothing</span><em id="filter-strength-meta">—</em></span>
           <input id="filter-strength" type="range" min="0" max="100" step="1" value="55" />
         </label>

@@ -70,13 +70,14 @@ Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
   measured rate once it is running. **Follow movement** is off by default so
   the avatar dances on its mark; enable it to let the avatar step with the
   person, bounded to a small cone.
-* **Smoothing** – one global filter bank over the whole rig. **Butterworth**
-  (2nd-order, the default: the flattest passband for the lag it costs),
-  **One Euro** (adaptive: steady while a limb is still, quick when it moves) or
-  **Exponential** (plain single-pole), or **Off**. **Smoothing** sets the
-  cutoff, **De-jitter** holds movement smaller than a threshold as tracking
-  noise, which is what removes the last stand-still shiver. The choice is
-  remembered in the browser.
+* **Smoothing** – one global filter bank over the whole rig, built from the
+  real-time methods of the reference projects in `filters/` (see
+  [Filters](#filters)): **Butterworth**, **One Euro**, **Exponential**,
+  **moving average**, **weighted average**, **HDE**, **Kalman (velocity)**,
+  **Kalman (adaptive)**, or **Off**. **Smoothing** sets the cutoff — or, for the three windowed methods,
+  the window length in frames — and **De-jitter** holds movement smaller than a
+  threshold as tracking noise, which is what removes the last stand-still
+  shiver. The choice is remembered in the browser.
 * **Avatar** – **Load VRM…** swaps the avatar from disk, locally.
 * **OBS output** – **Chroma key** puts a flat key colour behind the avatar and
   takes the floor, grid, ring and blob shadow out of the shot. The two swatches
@@ -186,8 +187,8 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
   auxiliary landmarks are low-passed in camera space *before* any bone is
   solved, the root translation with them, and every bone's finished local
   rotation once afterwards — so a bad frame is quietened on the way in and the
-  residual is quietened on the way out. Three filters share the cutoff knob: a
-  2nd-order Butterworth biquad (Q = 1/√2), One Euro, and a plain exponential.
+  residual is quietened on the way out. Ten filters share the cutoff knob,
+  ported from the reference projects in `filters/` (see [Filters](#filters)).
   Quaternions are filtered component-wise on one hemisphere and renormalised,
   which is stable and needs no wrap-around bookkeeping. On top of the filter, a
   deadband holds sub-threshold movement: a low-pass decays towards a still pose
@@ -199,6 +200,40 @@ video/camera ──> app/capture.py ──> LiveInstantHMR (child process) ─�
 The worker is independent of the input: switching videos or cameras keeps it
 alive and it simply follows the new frames. Stopping **3D live** (or closing
 the page) stops it; the server also stops it on shutdown.
+
+## Filters
+
+`web/src/filters.js` is one filter bank applied to the whole rig: the
+reconstructed joints and landmarks on the way in, and every bone's finished
+local rotation on the way out. The methods are the real-time ones from the
+reference projects in `filters/`:
+
+| Panel | Method | Ported from | Note |
+| --- | --- | --- | --- |
+| Butterworth | 2nd-order biquad, Q = 1/√2 | `mocap-refinement/filters/BF.py` | the reference runs `filtfilt` over a whole clip, which a live feed cannot do; this is the causal equivalent |
+| Exponential | one-pole | `mocap-refinement/filters/EMA.py` | alpha derived from the cutoff rather than a constant |
+| One Euro | adaptive one-pole | — | steady while a limb is still, quick when it moves |
+| Moving average | uniform window | `mocap-refinement/filters/SMA.py` | |
+| Weighted average | triangular window, newest heaviest | `mocap-refinement/filters/WMA.py` | a causal window cannot be symmetric |
+| HDE | smoothing plus a trend term | `mocap-refinement/filters/HDE.py` | keeps the reference's trend rate, takes alpha from the cutoff |
+| Kalman (velocity) | constant-velocity Kalman | `mocap-refinement/filters/KF1.py` | steady-state gains: β = α²/(2−α) |
+| Kalman (adaptive) | velocity Kalman, gain falls on a jump | `FLK/FLK/AKF.py` | AKF's low-confidence branch is a gain floor here, not a hard gate: a limb re-entering frame steps a long way in one sample, and a hard gate would freeze the bone |
+
+One-state Kalman (`KF0.py`) is an exponential filter, so it is not listed
+twice. The three-state one (`KF2.py`) is left out because its acceleration
+gain grows without bound as the cutoff nears Nyquist at this frame rate: part
+of the slider would diverge rather than smooth. `SG.py` smooths a *centred*
+window; run causally it has to extrapolate the polynomial to the newest sample,
+which measured a 1.1× gain on 15 Hz noise — it would add the shake it exists to
+remove. `INT.py` fills missing samples, which this app does not need: a frame
+with a missing joint is rejected upstream. `TSVD`, `LRMC`, `NLRMC` and `RPCA` are batch methods that
+need the finished clip, and `ODAE`, `UAE`, `UDAE`, `RNN`, `N-euro` and
+`motion_rolling_prediction` are trained networks with PyTorch checkpoints.
+None of those can run per frame in this page.
+
+The windowed methods are tuned in frames rather than hertz, but the same
+**Smoothing** slider drives them: it maps a cutoff to the equivalent window
+length, so the panel means one thing either way.
 
 ## API
 

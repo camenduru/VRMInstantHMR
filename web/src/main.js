@@ -10,6 +10,7 @@ import {
 } from '@pixiv/three-vrm-animation';
 
 import { MocapRetargeter } from './mocap.js';
+import { WINDOW_TYPES, windowForCutoff } from './filters.js';
 
 const canvas = document.getElementById('view');
 const loaderEl = document.getElementById('loader');
@@ -685,7 +686,12 @@ function applySmoothing({ persist = true } = {}) {
 
   filterStrength.disabled = off;
   filterDeadband.disabled = off;
-  filterStrengthMeta.textContent = off ? 'off' : `${cutoff.toFixed(1)} Hz`;
+  // the windowed methods are tuned in frames, everything else in Hz
+  filterStrengthMeta.textContent = off
+    ? 'off'
+    : (WINDOW_TYPES.includes(type)
+      ? `${windowForCutoff(cutoff)} frames`
+      : `${cutoff.toFixed(1)} Hz`);
   filterDeadbandMeta.textContent = off ? 'off' : `${deadband.toFixed(1)}°`;
 
   if (state.retargeter) {
