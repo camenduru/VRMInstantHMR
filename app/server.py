@@ -19,6 +19,8 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -152,6 +154,25 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
         target = VIDEOS_DIR / clean
         target.write_bytes(body)
         return {'source': f'video:{clean}', 'name': clean}
+
+    @app.post('/api/browser-frame')
+    async def browser_frame(request: Request):
+        """Receive a JPEG frame from the browser webcam (Web/MJPEG stream)."""
+        if capture.source != 'browser:camera':
+            return JSONResponse({'error': 'browser camera source not active'},
+                                status_code=409)
+        body = await request.body()
+        if not body:
+            return JSONResponse({'error': 'empty frame'}, status_code=400)
+        arr = np.frombuffer(body, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return JSONResponse({'error': 'could not decode frame'},
+                                status_code=400)
+        ok = capture.push_frame(frame)
+        if not ok:
+            return JSONResponse({'error': 'frame rejected'}, status_code=409)
+        return {'ok': True}
 
     # -------------------------------------------------------------- live 3D
     @app.get('/api/live')

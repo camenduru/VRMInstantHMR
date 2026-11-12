@@ -245,6 +245,95 @@ const state = {
   obs: false,
 };
 
+let browserCam = {
+  stream: null,
+  video: null,
+  canvas: null,
+  timer: 0,
+  sending: false,
+  active: false,
+};
+
+async function stopBrowserCamera() {
+  browserCam.active = false;
+  if (browserCam.timer) {
+    window.clearInterval(browserCam.timer);
+    browserCam.timer = 0;
+  }
+  if (browserCam.stream) {
+    for (const track of browserCam.stream.getTracks()) track.stop();
+  }
+  browserCam.stream = null;
+  if (browserCam.video) {
+    browserCam.video.srcObject = null;
+  }
+  browserCam.video = null;
+  browserCam.canvas = null;
+  browserCam.sending = false;
+}
+
+async function startBrowserCamera() {
+  if (browserCam.active || state.source !== 'browser:camera') return;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast('Browser camera not supported in this browser',
+      { sticky: true, error: true });
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    if (state.source !== 'browser:camera') {
+      for (const track of stream.getTracks()) track.stop();
+      return;
+    }
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    const canvas = document.createElement('canvas');
+    browserCam = { stream, video, canvas, timer: 0, sending: false, active: true };
+
+    const sendFrame = async () => {
+      if (!browserCam.active || browserCam.sending) return;
+      const v = browserCam.video;
+      if (!v || v.readyState < 2) return;
+      const w = v.videoWidth || 1280;
+      const h = v.videoHeight || 720;
+      if (browserCam.canvas.width !== w || browserCam.canvas.height !== h) {
+        browserCam.canvas.width = w;
+        browserCam.canvas.height = h;
+      }
+      const ctx = browserCam.canvas.getContext('2d');
+      ctx.drawImage(v, 0, 0, w, h);
+      browserCam.sending = true;
+      try {
+        const blob = await new Promise((resolve) =>
+          browserCam.canvas.toBlob(resolve, 'image/jpeg', 0.82));
+        if (!blob || !browserCam.active) return;
+        await fetch('/api/browser-frame', {
+          method: 'POST',
+          headers: { 'Content-Type': 'image/jpeg' },
+          body: blob,
+          keepalive: true,
+        });
+      } catch {
+        /* dropped frame; keep streaming */
+      } finally {
+        browserCam.sending = false;
+      }
+    };
+    browserCam.timer = window.setInterval(sendFrame, 1000 / 24);
+    sendFrame();
+  } catch (err) {
+    showToast(`Browser camera failed: ${err.message || err}`,
+      { sticky: true, error: true });
+  }
+}
+
 let blinkExpression = null;
 let blinkTimer = 2;
 let blinkPhase = 0;
@@ -527,7 +616,15 @@ async function poll() {
     ]);
     state.capture = status.capture || {};
     state.liveInfo = status.live || null;
-    state.source = status.capture?.source || state.source;
+    const nextSource = status.capture?.source || state.source;
+    if (nextSource !== state.source) {
+      state.source = nextSource;
+      if (state.source === 'browser:camera') startBrowserCamera();
+      else if (browserCam.active) stopBrowserCamera();
+    } else {
+      state.source = nextSource;
+      if (state.source === 'browser:camera' && !browserCam.active) startBrowserCamera();
+    }
     renderSources(sources);
     renderStats();
   } catch {
@@ -610,11 +707,15 @@ sourceSelect.addEventListener('change', async () => {
     state.tracking = false;
     state.source = source;
     if (state.retargeter) state.retargeter.reset();
+    await stopBrowserCamera();
+    if (source === 'browser:camera') startBrowserCamera();
     showToast(`Input: ${sourceSelect.selectedOptions[0]?.textContent || source}`);
   } catch (err) {
     showToast(`Input failed: ${err.message}`, { sticky: true, error: true });
   }
 });
+
+window.addEventListener('beforeunload', () => { stopBrowserCamera(); });
 
 /* ------------------------------------------------------------ live toggle */
 async function setLive(on) {

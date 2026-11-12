@@ -26,6 +26,7 @@ PREVIEW_WIDTH = 640
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERAS = 4
+BROWSER_SOURCE = 'browser:camera'
 
 # SMPL22 body edges, drawn between the mapped MHR landmarks.
 SMPL_EDGES = (
@@ -68,6 +69,8 @@ class Capture:
         self.frame_sink = None
         # ``() -> live pose dict`` used only to draw the preview skeleton
         self.pose_provider = None
+        # timestamps for pushed (browser) frame FPS
+        self._push_times: list[float] = []
 
     # ---------------------------------------------------------------- sources
     def _videos(self) -> list[dict]:
@@ -86,8 +89,10 @@ class Capture:
         return items
 
     def available_sources(self) -> list[dict]:
-        items = [{'id': f'camera:{i}', 'label': f'Camera {i}',
-                  'kind': 'camera'} for i in range(CAMERAS)]
+        items = [{'id': BROWSER_SOURCE, 'label': 'Browser camera',
+                  'kind': 'camera'}]
+        items.extend({'id': f'camera:{i}', 'label': f'Camera {i}',
+                      'kind': 'camera'} for i in range(CAMERAS))
         items.extend(self._videos())
         if self.source and not any(i['id'] == self.source for i in items):
             items.insert(0, {'id': self.source, 'label': self.source,
@@ -110,9 +115,11 @@ class Capture:
         return None
 
     def set_source(self, source: str) -> None:
-        """Switch input; ``camera:N`` or ``video:<name>``."""
+        """Switch input; ``camera:N``, ``browser:camera`` or ``video:<name>``."""
         kind, _, value = source.partition(':')
-        if kind == 'camera':
+        if source == BROWSER_SOURCE:
+            pass
+        elif kind == 'camera':
             if not value.isdigit() or int(value) >= CAMERAS:
                 raise ValueError(f'unknown camera {source!r}')
         elif kind == 'video':
@@ -139,6 +146,8 @@ class Capture:
             self._thread = None
 
     def _open(self, source: str):
+        if source == BROWSER_SOURCE:
+            return None, None, 'Browser camera'
         kind, _, value = source.partition(':')
         if kind == 'camera':
             index = int(value)
@@ -184,6 +193,7 @@ class Capture:
                 current = pending
                 media_frame = 0
                 times.clear()
+                self._push_times.clear()
                 try:
                     cap, frame_interval, label = self._open(current)
                 except Exception as exc:  # noqa: BLE001
@@ -202,6 +212,11 @@ class Capture:
                                         kind=current.partition(':')[0],
                                         error='', fps=0.0, frames=0,
                                         media_t=None)
+                continue
+
+            # Browser camera: frames are pushed externally via push_frame().
+            if current == BROWSER_SOURCE:
+                time.sleep(0.02)
                 continue
 
             if cap is None or not current:
@@ -295,6 +310,57 @@ class Capture:
         out_h = max(1, round(h * out_w / w))
         return cv2.resize(preview, (out_w, out_h),
                           interpolation=cv2.INTER_AREA)
+
+    # ----------------------------------------------------------- pushed frames
+    def push_frame(self, frame: np.ndarray, wall_time: Optional[float] = None) -> bool:
+        """Accept a frame for the browser camera source.
+
+        Returns True if the frame was consumed.
+        """
+        if wall_time is None:
+            wall_time = time.time()
+        with self._lock:
+            if self.source != BROWSER_SOURCE or self._status.get('state') != 'running':
+                return False
+
+        sink = self.frame_sink
+        if sink is not None:
+            try:
+                sink(frame, wall_time)
+            except Exception as exc:  # noqa: BLE001
+                print(f'[live3d] frame sink failed: {exc}', flush=True)
+                self.frame_sink = None
+
+        pose = None
+        provider = self.pose_provider
+        if provider is not None:
+            try:
+                pose = provider()
+            except Exception:  # noqa: BLE001
+                pose = None
+        preview = self._render(frame, pose)
+
+        now = time.perf_counter()
+        with self._lock:
+            times = self._push_times
+            times.append(now)
+            while times and now - times[0] > 1.5:
+                times.pop(0)
+            fps = (len(times) - 1) / (times[-1] - times[0]) \
+                if len(times) > 1 else 0.0
+
+        ok, encoded = cv2.imencode('.jpg', preview,
+                                   [cv2.IMWRITE_JPEG_QUALITY, 80])
+        h, w = frame.shape[:2]
+        with self._lock:
+            if ok:
+                self._jpeg = encoded.tobytes()
+                self._seq += 1
+            self._status.update(width=w, height=h,
+                                fps=round(fps, 1),
+                                frames=self._status.get('frames', 0) + 1,
+                                media_t=None)
+        return True
 
     # --------------------------------------------------------------- snapshots
     def status(self) -> dict:
