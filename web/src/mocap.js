@@ -193,6 +193,13 @@ function oneEuro(dt, speed, { minCutoff, beta }) {
 const AXIS_Y = new THREE.Vector3(0, 1, 0);
 const AXIS_Z = new THREE.Vector3(0, 0, 1);
 
+// rad/s: how fast a bone may roll about its own axis. See poseBone: the roll
+// comes from a reference direction whose projection is 1/sin amplified near
+// the poses where a limb points along it, and the live feed turned a femur
+// 20-50 degrees in one frame that way. A human turn-out peaks near 8 rad/s,
+// so this clips only what a body cannot do. Kept in the file's measured style.
+const ROLL_MAX_RATE = 12.2;
+
 export class MocapRetargeter {
   constructor(vrm, root) {
     this.vrm = vrm;
@@ -311,6 +318,13 @@ export class MocapRetargeter {
     this._fQb = new THREE.Quaternion();
     this._fQc = new THREE.Quaternion();
     this._fQw = new THREE.Quaternion();
+    this._fQp = new THREE.Quaternion();
+    /** Cross product scratch for the roll measured in poseBone. */
+    this._fRoll = new THREE.Vector3();
+    /** Last applied roll per bone (rad), for the rate limit. */
+    this._rollPrev = Object.create(null);
+    /** Frame time, so poseBone's rate limit is per second not per call. */
+    this._dt = 1 / 60;
     // body frame in avatar space, refreshed by basis3D every frame
     this._upBody = new THREE.Vector3(0, 1, 0);
     this._fwdBody = new THREE.Vector3(0, 0, 1);
@@ -335,6 +349,8 @@ export class MocapRetargeter {
     this._target = new THREE.Vector3();
     this._soleA = new THREE.Vector3();
     this._soleB = new THREE.Vector3();
+    this._ankleA = new THREE.Vector3();
+    this._ankleB = new THREE.Vector3();
     this._soleTmp = new THREE.Vector3();
     // Foot planting: footlock.js detects contact on the natural pose and
     // footik.js holds a planted sole with a two-bone leg IK. A root offset
@@ -821,27 +837,78 @@ export class MocapRetargeter {
     const axis = this._fDir.copy(dir).normalize();
     const refW = this._fRef.copy(ref || this._fwdBody);
     refW.addScaledVector(axis, -refW.dot(axis));
-    if (refW.lengthSq() < 1e-10) {
+    // How much of the measured reference is left PERPENDICULAR to the bone.
+    // Near zero, the bone points along the reference and it says nothing about
+    // the roll; see the blend below.
+    let perp = refW.lengthSq();
+    if (perp < 1e-10) {
       refW.crossVectors(axis, Math.abs(axis.y) < 0.9 ? AXIS_Y : AXIS_Z);
       if (refW.lengthSq() < 1e-10) return;
+      // the measured reference has nothing to say here: let the carried roll
+      // win outright rather than snapping to a world axis
+      perp = 0;
     }
     refW.normalize();
 
     // swing the local primary axis onto the measured direction
     this._fQa.setFromUnitVectors(frame.axis, axis);
-    // then spin about that direction until the local reference lands on the
-    // measured one
+    // The rest roll carried by that swing: the bone's own reference spun with
+    // the bone, ALWAYS perpendicular to the new axis. This is the roll a ball
+    // joint produces with no internal/external rotation, so it is both a
+    // physically possible pose and a continuous function of the direction.
     this._fSpin.copy(frame.ref).applyQuaternion(this._fQa);
     this._fSpin.addScaledVector(axis, -this._fSpin.dot(axis));
     this._fQw.copy(this._fQa);
     if (this._fSpin.lengthSq() > 1e-10) {
       this._fSpin.normalize();
+      // How much of the MEASURED reference is perpendicular to the bone. Near
+      // zero the bone points along it and the reference says nothing about the
+      // roll: its projected direction is 1/sin(angle) amplified, so a 1 degree
+      // change of the leg turned the femur 20-47 degrees in a single frame,
+      // measured on the live dance feed while the leg itself moved about 1
+      // degree. Fade it out and keep the rest roll instead. Past 26 degrees
+      // (sin > 0.44) the measurement is fully trusted, so an ordinary pose is
+      // unchanged.
+      const trust = clamp((Math.sqrt(perp) - 0.08) / 0.18, 0, 1);
+      if (trust < 1) {
+        refW.lerp(this._fSpin, 1 - trust);
+        if (refW.lengthSq() < 1e-6) refW.copy(this._fSpin);
+        refW.normalize();
+      }
+
+      // Rate-limit the spin about the bone axis. The roll is measured against
+      // the rest roll the swing already carries, so it is ~0 for a bone that
+      // merely moves and non-zero only when the person really rotates about the
+      // limb; the bone direction cannot feed into it. What is left in it is
+      // tracking noise on the reference, and the live feed turned the femur
+      // 20-50 degrees in a single frame that way while the leg itself moved
+      // 1-3 degrees - a rotation no hip can make. A real turn-out is ~400-500
+      // deg/s, so a cap at 700 only ever clips things a body cannot do.
+      this._fRoll.crossVectors(this._fSpin, refW);
+      const theta = Math.atan2(this._fRoll.dot(axis), this._fSpin.dot(refW));
+      const prev = this._rollPrev[name];
+      let th = theta;
+      if (prev !== undefined) {
+        let d = theta - prev;
+        if (d > Math.PI) d -= 2 * Math.PI;
+        else if (d < -Math.PI) d += 2 * Math.PI;
+        const lim = ROLL_MAX_RATE * this._dt;
+        if (d > lim) th = prev + lim;
+        else if (d < -lim) th = prev - lim;
+      }
+      this._rollPrev[name] = th;
+      if (th !== theta) {
+        this._fQb.setFromAxisAngle(axis, th);
+        refW.copy(this._fSpin).applyQuaternion(this._fQb).normalize();
+      }
+
+      // then spin about the bone axis until the local reference lands on it
       this._fQb.setFromUnitVectors(this._fSpin, refW);
       this._fQw.premultiply(this._fQb);
     }
 
-    bone.parent.getWorldQuaternion(this._fQc);
-    this._fQc.invert().multiply(this._fQw);
+    bone.parent.getWorldQuaternion(this._fQp);
+    this._fQc.copy(this._fQp).invert().multiply(this._fQw);
 
     this._before.copy(bone.quaternion);
     bone.quaternion.copy(this._fQc);
@@ -858,6 +925,7 @@ export class MocapRetargeter {
   update(pose, dt) {
     if (!this.enabled || !this.b.hips) return;
     dt = clamp(dt, 0.001, 0.1);
+    this._dt = dt;
 
     // FlowHMR frames carry exact 3D joints instead of 2D keypoints; they take
     // the whole body path, including the root translation.
@@ -1969,6 +2037,15 @@ export class MocapRetargeter {
         if (this._t5.lengthSq() < 1e-8) this._t5.copy(shoulderFwd);
         this._t5.normalize();
       }
+      // No yaw clamp here. An earlier one constrained the ankle to the PELVIS
+      // forward, which is not the frame an ankle lives in: a dancer turns the
+      // whole leg out, the pelvis keeps facing forward, and a foot forced to
+      // agree with the pelvis has to counter-rotate against its own shin - the
+      // boot corkscrewed round on every hip turn-out. The honest reference is
+      // the knee plane, and the reconstruction already respects it: measured
+      // against the plane through the knee, the person's ankle yaw stays inside
+      // +-35 degrees on every frame of the live feed, and so does the avatar's
+      // (0 frames past 90, against 30-35 before the clamp went in).
       this.poseBone(`${side}Foot`, this._t5, footUp, w);
     }
 
@@ -2048,18 +2125,18 @@ export class MocapRetargeter {
     const ky = damp(dt, floored ? FLOOR_TAU : TAU_ROOT_Y);
     this.root.position.y += (this._target.y - this.root.position.y) * ky;
 
-    // The plant IK rewrites leg rotations, so the global smoothing pass MUST
-    // run after it - filtering before the plant left the IK's frame-to-frame
-    // changes completely unsmoothed, which showed up as shaking knees.
-    // Planting after the filter was measured as well: it moved the residual
-    // slide by under 4% (0.105 m vs 0.109 m of travel per stance), so it buys
-    // nothing and costs the smoothing that keeps the corrected legs calm.
-    // Both the filter and the IK can drop a sole by a centimetre or two, so
-    // re-solve the floor LAST: this is the final write before vrm.update()
-    // skins the mesh, and keeps the earlier sinking fix intact.
+    // The plant IK rewrites leg rotations, so it has to be the LAST pass that
+    // touches the legs. Running the global filter after it (as this used to)
+    // meant every frame ended by blending the corrected thigh and shin back
+    // towards the unfiltered reconstruction, which walks the sole straight off
+    // its anchor - with contact now held on ~93% of frames that is the
+    // difference between 0.5 cm and 18 cm of drift per stance. Filtering
+    // first is also the calmer order: the IK's two-bone solve is a function of
+    // the (already filtered) hip position and a fixed target, so its output is
+    // smooth by construction and does not need a second filter.
+    this._applyOutputFilter(dt);
     this._floorClamp(this._floorSample(ground));
     this._plantFeet(dt, weight, ground);
-    this._applyOutputFilter(dt);
     this._floorClamp(this._floorSample(ground));
   }
 
@@ -2102,10 +2179,10 @@ export class MocapRetargeter {
    * The root is left completely alone - it is the one transform shared by
    * both feet, so moving it can only trade foot skate for whole-body sliding.
    *
-   * Order matters: this runs BEFORE the global output filter (see update3D),
-   * because the IK rewrites leg rotations and filtering first left those
-   * corrections completely unsmoothed. The filter is followed by one last
-   * floor clamp, so neither pass can push a sole through the floor.
+   * Order matters: this runs AFTER the global output filter (see update3D),
+   * because a filter applied to the corrected legs drags the sole off its
+   * anchor; the filter is followed by one last floor clamp, so neither pass
+   * can push a sole through the floor.
    */
   _plantFeet(dt, weight, ground) {
     const lock = this.footLock;
@@ -2116,13 +2193,16 @@ export class MocapRetargeter {
     // Natural soles, before any IK has touched a bone. Detection runs even
     // with the pass switched off, so toggling the panel back on never picks
     // up a stale anchor (and the measurement probes can compare ON and OFF
-    // on the very same contact windows).
+    // on the very same contact windows). The soles decide contact; the ankles
+    // are the points the hold actually pins (see footlock.js update()).
     const left = this.solePoint('left', this._soleA);
     const right = this.solePoint('right', this._soleB);
+    const leftAnkle = this.b.leftFoot.getWorldPosition(this._ankleA);
+    const rightAnkle = this.b.rightFoot.getWorldPosition(this._ankleB);
     const rx = this.root.position.x;
     const rz = this.root.position.z;
-    const feet = lock.update(left, right, this.rest.sole, rx, rz,
-      dt, strength);
+    const feet = lock.update(left, right, [leftAnkle, rightAnkle],
+      this.rest.sole, rx, rz, dt, strength);
 
     // Ease the constraint in/out with the checkbox and with the close-up
     // fade, instead of snapping a leg to its anchor on the first frame.
@@ -2136,7 +2216,7 @@ export class MocapRetargeter {
       const foot = feet[i];
       const side = i ? 'right' : 'left';
       this.footIK.plant(side, foot.anchor.x + rx, foot.anchor.y + rz,
-        foot.weight * strength * this._plantGain, dt);
+        foot.weight * strength * this._plantGain, dt, foot.fresh);
     }
   }
 
@@ -2171,6 +2251,7 @@ export class MocapRetargeter {
     this.hasJoint.fill(0);
     this.dirState.clear();
     this.limbRef.clear();
+    this._rollPrev = Object.create(null);
     for (const key of Object.keys(this._lm3)) this._lm3[key].valid = false;
     this._hipFwd.set(0, 0, 1);
     this._headFwd.set(0, 0, 1);
@@ -2210,6 +2291,8 @@ export class MocapRetargeter {
     if (this.footIK) {
       this.footIK.corr.left.set(0, 0);
       this.footIK.corr.right.set(0, 0);
+      this.footIK._prevW.left = 0;
+      this.footIK._prevW.right = 0;
     }
   }
 }

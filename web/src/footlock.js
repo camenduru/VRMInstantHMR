@@ -52,29 +52,72 @@
  *    of a standing person reads as 0.3 m/s, so a raw gate finds no contact at
  *    all and the whole pass silently does nothing. A low-pass keeps a
  *    sustained glide at its true speed while averaging zero-mean jitter away.
+ *    (The ANCHOR is the one exception and reads the raw sole - see the plant
+ *    below; denoising the thing you are about to hold puts the hold itself
+ *    off target.)
  *
  * TUNING. The thresholds are instance fields (`this.contact`) rather than
  * module constants so they can be swept against a real clip without a
- * rebuild; `CONTACT` below is only the default. Measured on the bundled dance
- * clip, the reconstruction keeps BOTH soles under 5 cm for 159-160 of 160
- * frames, so height alone can never separate a stance from a step there -
- * speed has to do that work.
+ * rebuild; `CONTACT` below is only the default.
+ *
+ * The gate reads three things, and only one of them had to be tightened. On a
+ * 722-frame live capture the soles glide horizontally at 0.27 m/s (median,
+ * filtered) even while they are on the floor - that footage is zero-mean
+ * tracking jitter, not walking, because each sole nets only 10-25 cm over
+ * 28 s. A horizontal-only gate at the old 0.08 m/s therefore called just
+ * 8-15% of frames a contact, and a hold that is off 90% of the time cannot
+ * stop a foot from skating. Horizontal speed is now only a coarse "that is a
+ * real swing" test; the vertical derivative does the stance/step separation
+ * (median |dy/dt| of the lower sole is 0.03-0.08 m/s against 0.5-1.5 m/s for
+ * a foot being lifted), and height keeps a raised foot out.
  */
 
 import * as THREE from 'three';
 
 const CONTACT = {
-  height: 0.035,        // m over the bind sole that still counts as down
-  releaseHeight: 0.06,  // hysteresis: keep the contact until it is clearly up
-  speed: 0.08,          // m/s of natural sole motion that still counts as planted
-  releaseSpeed: 0.16,
+  height: 0.05,         // m over the bind sole that still counts as down
+  releaseHeight: 0.09,  // hysteresis: keep the contact until it is clearly up
+  speed: 0.90,          // m/s of horizontal sole glide that still counts as planted
+  releaseSpeed: 1.30,   // hysteresis: only a real swing is faster than this
+  lift: 0.30,           // m/s of vertical motion that still counts as planted
+  releaseLift: 0.60,
   attack: 0.04,         // s to ramp a contact in
   release: 0.12,        // s to ramp it out
   hold: 0.25,           // s a stance survives with no contact before it ends
-  step: 0.20,           // m the sole may leave its anchor before it is a new step
-  filter: 0.08,         // s low-pass on the position used to place the anchor
+  // s the HOLD survives with no contact; the anchor outlives the force.
+  // One frame of this reconstruction's tracking glitches moves the ankle 15-23
+  // cm, and that glitch is itself what makes the contact gate open - so a
+  // force that let go after a single frame let the pose snap onto the glitch
+  // and snap back on the next frame. That read as the leg popping exactly when
+  // the lock was on. Two frames of grace rides the glitch out while a real
+  // swing (0.25 s and up) still releases well before the foot lands.
+  weightHold: 0.10,
+  // m the sole may leave its anchor before it is a new step.
+  //
+  // This is also the largest hold a stance can ever ask the leg IK for, which
+  // is what makes its size matter. At 0.30 a stance let the sole get 28 cm
+  // from its anchor - a leg 0.729 m long standing at 94-98% of its extension,
+  // so the IK was being asked to bend past what the bones allow - and when the
+  // stance finally ended the whole correction was dropped in ONE frame: the
+  // foot teleported 15-23 cm while the reconstruction itself moved it only
+  // 0.4-3.7 cm. Measured over the 722-frame replay that was the single
+  // largest source of the legs popping; the worst leg jump was 67.8 deg at
+  // 0.30. At 0.13 the worst is 24 deg against 21.7 deg with the lock off, and
+  // no frame exceeds 25 deg. The foot's total travel while it is on the floor
+  // falls from 22.9 cm/s (lock off) to 14.5, and hold accuracy does not suffer
+  // (error p90 1.7-1.8 cm): a stance ends while the correction is still small,
+  // instead of after it has grown into something the leg cannot take.
+  step: 0.13,
+  // Fraction of `step` over which the force fades to zero. The correction is
+  // proportional to the drift (that is the whole job), so ending a stance at
+  // full force drops whatever it had grown to in one frame. Fading over the
+  // last quarter means the leg is already back to its natural pose when the
+  // stance ends: the release stops being an event at all. Measured on the
+  // replay the worst held-to-landing jump was still 10 cm before this.
+  taper: 0.25,
+  filter: 0.08,         // s low-pass on the position used by the gate and step test
   creep: 0.0,           // m/s the anchor may drift; 0 means a held foot never drifts
-  leash: 0.30,          // m: safety limit, drag the anchor past what a leg can absorb
+  leash: 0.45,          // m: safety limit, drag the anchor past what a leg can absorb
 };
 
 const damp = (dt, tau) => 1 - Math.exp(-dt / tau);
@@ -87,13 +130,17 @@ class FootState {
     this.seen = false;
     this.speed = 0;
     this.speedRaw = 0;
+    this.lift = 0;                      // m/s of vertical sole motion, low-passed
     this.error = 0;
     this.lost = 0;                      // s since the last contact frame
     this.anchor = new THREE.Vector2();  // root-relative x, z
     this.last = new THREE.Vector2();    // previous natural root-relative x, z
     this.filt = new THREE.Vector2();    // low-passed natural position
     this.lastFilt = new THREE.Vector2();// previous low-passed position
-    this.err = new THREE.Vector2();     // anchor - natural sole (x, z)
+    this.filtY = 0;                     // low-passed height over the bind sole
+    this.lastFiltY = 0;
+    this.err = new THREE.Vector2();     // anchor - natural ankle (x, z)
+    this.fresh = false;                 // this frame opened a new stance
   }
 
   clear() {
@@ -103,8 +150,12 @@ class FootState {
     this.seen = false;
     this.speed = 0;
     this.speedRaw = 0;
+    this.lift = 0;
     this.error = 0;
     this.lost = 0;
+    this.filtY = 0;
+    this.lastFiltY = 0;
+    this.fresh = false;
     this.err.set(0, 0);
   }
 }
@@ -140,13 +191,21 @@ export class FootLock {
   }
 
   /**
-   * Consume this frame's NATURAL sole positions.
+   * Consume this frame's NATURAL foot positions.
    *
-   * `left`/`right` are the lowest skin points of each foot in world space,
-   * `groundY` their bind-pose floor height, `rootX`/`rootZ` the avatar root,
+   * `left`/`right` are the lowest skin points of each foot in world space and
+   * `ankles` the two foot bones (ankles). The sole is what decides CONTACT -
+   * it is the thing on the floor - but the ANKLE is what the hold pins: the
+   * lowest skin point migrates from heel to toe as the shoe pitches, and a
+   * constraint on that point has to translate the whole foot to follow it.
+   * Measured on the live capture, pinning the sole still let the foot bone
+   * move 5-6 cm per stance, purely as the pitch changed; pinning the ankle
+   * leaves the sole free to roll, which is what a real planted foot does.
+   *
+   * `groundY` is the bind-pose floor height, `rootX`/`rootZ` the avatar root,
    * and `strength` the share of the pass to apply (0 in a close-up).
    */
-  update(left, right, groundY, rootX, rootZ, dt, strength = 1) {
+  update(left, right, ankles, groundY, rootX, rootZ, dt, strength = 1) {
     const C = this.contact;
     dt = Number.isFinite(dt) && dt > 0
       ? Math.min(0.1, Math.max(0.001, dt)) : 1 / 60;
@@ -155,6 +214,7 @@ export class FootLock {
     for (let i = 0; i < 2; i++) {
       const p = soles[i];
       const foot = this.feet[i];
+      foot.fresh = false;
       if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y) ||
           !Number.isFinite(p.z)) {
         foot.weight *= 1 - damp(dt, C.release);
@@ -165,20 +225,33 @@ export class FootLock {
         foot.err.set(0, 0);
         continue;
       }
-      const u = this._u.set(p.x - rootX, p.z - rootZ);
+      const A = ankles && ankles[i];
+      const u = this._u.set(
+        (A && Number.isFinite(A.x) ? A.x : p.x) - rootX,
+        (A && Number.isFinite(A.z) ? A.z : p.z) - rootZ);
 
       // Spike-free position. A one-frame tracking jump must not be mistaken
-      // for the foot walking somewhere, so the anchor, the step test and the
-      // contact gate all read this. The gate especially: on a 17 fps live feed
-      // the raw per-frame jitter of a standing person already reads as
-      // 0.3 m/s, so a gate fed the raw sole finds no contact at all and the
-      // plant silently does nothing. A low-pass keeps a sustained glide or
-      // step at its true speed while averaging zero-mean jitter away.
+      // for the foot walking somewhere, so the step test and the contact gate
+      // read this. The gate especially: on a live feed the raw per-frame
+      // jitter of a standing person already reads as 0.3 m/s, so a gate fed
+      // the raw foot finds no contact at all and the plant silently does
+      // nothing. A low-pass keeps a sustained glide or step at its true speed
+      // while averaging zero-mean jitter away.
+      //
+      // The height is low-passed as well, but only to differentiate it: a
+      // stance is a foot that is DOWN and STAYS down. Horizontal glide is not
+      // a useful contact signal on this reconstruction (measured below), so
+      // it is the vertical derivative that separates a stance from a swing -
+      // a foot being lifted moves vertically at 0.5-1.5 m/s while a planted
+      // one barely moves at all.
       if (!foot.seen) {
         foot.filt.copy(u);
         foot.lastFilt.copy(u);
+        foot.filtY = p.y - groundY;
+        foot.lastFiltY = foot.filtY;
       } else {
         foot.filt.lerp(u, damp(dt, C.filter));
+        foot.filtY += (p.y - groundY - foot.filtY) * damp(dt, C.filter);
       }
       foot.speedRaw = foot.seen
         ? Math.hypot(u.x - foot.last.x, u.y - foot.last.y) / dt : 0;
@@ -186,25 +259,46 @@ export class FootLock {
         ? Math.hypot(foot.filt.x - foot.lastFilt.x,
           foot.filt.y - foot.lastFilt.y) / dt : 0;
       foot.speed = speed;
+      foot.lift = foot.seen
+        ? Math.abs(foot.filtY - foot.lastFiltY) / dt : 0;
       foot.last.copy(u);
       foot.lastFilt.copy(foot.filt);
+      foot.lastFiltY = foot.filtY;
       foot.seen = true;
 
       const height = p.y - groundY;
       const down = height < (foot.planted ? C.releaseHeight : C.height);
       const slow = speed < (foot.planted ? C.releaseSpeed : C.speed);
-      const contact = active && down && slow;
+      const level = foot.lift < (foot.planted ? C.releaseLift : C.lift);
+      const contact = active && down && slow && level;
       foot.planted = contact;
+      const wasLost = foot.lost;
       foot.lost = contact ? 0 : foot.lost + dt;
 
-      // A stance opens on a contact frame and is anchored where the sole is.
+      // A stance opens on a contact frame and is anchored where the sole IS,
+      // not where the low-pass thinks it is. The filter lags by ~0.08 s, so
+      // anchoring on `filt` started every stance 2-4 cm away from the real
+      // sole (0.27 m/s of glide x the filter time constant) and the IK then
+      // had to skate that distance back - measured as a 4 cm plant error that
+      // took three time constants to correct. The raw position here is the one
+      // the viewer sees touch down, which is exactly what a plant must hold.
+      // The filter stays where it belongs: in the contact gate, whose job is
+      // to ignore one-frame tracking spikes.
       if (!foot.anchored && contact) {
-        foot.anchor.copy(foot.filt);
+        foot.anchor.copy(u);
         foot.anchored = true;
+        // A re-anchor after a 1-2 frame dropout is the SAME stance resuming,
+        // not a new step. Marking it fresh made footik.js drop the correction
+        // it was carrying - up to 11 cm at weight 0.72, i.e. the last of the
+        // leg pops, all of them on frames exactly like these. Only a stance
+        // that actually let go (the foot was missing longer than the force
+        // keeps up with) may reset it; anything shorter is allowed to glide
+        // back at the correction's own time constant.
+        foot.fresh = wasLost > C.weightHold;
       }
 
-      // How far the sole has walked away from its anchor. Past `step` the foot
-      // is not being held any more - it has gone somewhere else.
+      // How far the ankle has walked away from its anchor. Past `step` the
+      // foot is not being held any more - it has gone somewhere else.
       const stepDist = foot.anchored
         ? Math.hypot(foot.filt.x - foot.anchor.x,
           foot.filt.y - foot.anchor.y) : 0;
@@ -214,8 +308,23 @@ export class FootLock {
         foot.lost <= C.hold && stepDist <= C.step;
       if (!holding) foot.anchored = false;
 
-      foot.weight += ((holding ? 1 : 0) - foot.weight) *
-        damp(dt, holding ? C.attack : C.release);
+      // The ANCHOR may outlive the contact by `hold`, but the FORCE may not.
+      // Letting the weight stay at 1 through a swing (which is what reading
+      // `holding` alone did) meant the IK kept pulling a foot that was already
+      // flying to its next step, and then every touchdown snapped the leg back
+      // by whatever that pull had grown to - the "legs pop" seen with the lock
+      // on. A stance now fades out over `weightHold` + `release`, so the
+      // correction is back to ~0 before the foot lands again.
+      //
+      // The force also fades as the drift approaches `step` (`taper`), because
+      // the correction grew with that same drift: releasing at full weight
+      // threw away up to 13 cm of pull in one frame, which is the remaining
+      // landing pop. See CONTACT.taper.
+      const taper = Math.min(1, Math.max(0,
+        (C.step - stepDist) / (C.step * C.taper)));
+      const driven = holding && foot.lost <= C.weightHold;
+      foot.weight += ((driven ? taper : 0) - foot.weight) *
+        damp(dt, driven ? C.attack : C.release);
 
       if (!holding) {
         foot.error = 0;
@@ -224,7 +333,7 @@ export class FootLock {
       }
 
       // The anchor is FROZEN while the stance lasts. That is the whole point
-      // of the plant: an anchor that follows the natural sole leaves the IK
+      // of the plant: an anchor that follows the natural foot leaves the IK
       // nothing to correct beyond the distance it is allowed to lag, so the
       // foot slides with the reconstruction and the pass measures as doing
       // nothing at all.
