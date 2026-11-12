@@ -145,6 +145,15 @@ const CROP_EDGE = 0.015;      // box this close to the frame edge = body cut off
 // How far a hidden arm hangs out from the ribs, as a share of the sideways
 // axis: straight down is a soldier, this is a relaxed shoulder.
 const ARM_SLACK = 0.16;
+// What a human elbow can actually do. The reconstruction sees a wrist
+// position, not a joint, and monocular depth error regularly puts the wrist
+// behind the elbow plane; without a limit the avatar folds its forearm
+// backwards or swings it sideways. Generous bounds, so a real pose is never
+// clipped: 10 degrees of hyperextension, 155 degrees of flexion, and 15
+// degrees of the small side-to-side give a hinge has left.
+const ELBOW_MIN = -0.17;      // rad
+const ELBOW_MAX = 2.70;       // rad
+const ELBOW_SIDE = 0.26;      // sin(15 deg)
 const TAU_FACE = 0.045;      // expression weight smoothing
 const TAU_FACE_HEAD = 0.07;  // facial head pose smoothing
 const TAU_FACE_GAZE = 0.09;  // iris jitter is fast; gaze needs its own band
@@ -375,6 +384,13 @@ export class MocapRetargeter {
     this._armUpper = new THREE.Vector3();
     this._armFore = new THREE.Vector3();
     this._armKnuck = new THREE.Vector3();
+    this._armBack = new THREE.Vector3();
+    this._armBackP = { left: new THREE.Vector3(), right: new THREE.Vector3() };
+    this._armBackOk = { left: false, right: false };
+    this._armForeBack = new THREE.Vector3();
+    this._elbowU = new THREE.Vector3();
+    this._elbowB = new THREE.Vector3();
+    this._elbowH = new THREE.Vector3();
     this._armPos = new THREE.Vector3();
     this._armChest = new THREE.Vector3();
     this._crop = 0;
@@ -1473,6 +1489,44 @@ export class MocapRetargeter {
   }
 
   /**
+   * Keep the forearm inside the range a human elbow can reach.
+   *
+   * `upper` is the upper-arm direction and `back` the anatomical back of that
+   * arm; together they define the elbow's hinge plane. The forearm is allowed
+   * to swing in that plane from a few degrees of hyperextension to 155 degrees
+   * of flexion, and almost not at all sideways. A wrist the reconstruction put
+   * outside those bounds is pulled back to the nearest legal direction instead
+   * of making the avatar fold its elbow through itself.
+   */
+  limitElbow(upper, fore, back, out) {
+    const u = this._elbowU.copy(upper);
+    const b = this._elbowB.copy(back).addScaledVector(u, -back.dot(u));
+    if (b.lengthSq() < 1e-8) return out.copy(fore);
+    b.normalize();
+    const hinge = this._elbowH.crossVectors(u, b);
+    if (hinge.lengthSq() < 1e-8) return out.copy(fore);
+    hinge.normalize();
+
+    const along = fore.dot(u);
+    const backward = fore.dot(b);
+    const sideways = fore.dot(hinge);
+    // Flexion angle from straight: + is bending toward the front of the arm,
+    // negative is hyperextension. atan2 keeps the whole 180 degree range.
+    const flex = Math.atan2(-backward, along);
+    if (flex >= ELBOW_MIN && flex <= ELBOW_MAX &&
+        Math.abs(sideways) <= ELBOW_SIDE) {
+      return out.copy(fore);
+    }
+
+    const angle = clamp(flex, ELBOW_MIN, ELBOW_MAX);
+    out.copy(u).multiplyScalar(Math.cos(angle))
+      .addScaledVector(b, -Math.sin(angle))
+      .addScaledVector(hinge, clamp(sideways, -ELBOW_SIDE, ELBOW_SIDE));
+    if (out.lengthSq() < 1e-8) return out.copy(fore);
+    return out.normalize();
+  }
+
+  /**
    * Put the person's camera-space skeleton into the avatar's world frame.
    *
    * InstantHMR reports joints in camera axes (x right, y down, z forward), and
@@ -1754,8 +1808,15 @@ export class MocapRetargeter {
       this.armDir(SMPL[`${p}Elbow`], SMPL[`${p}Wrist`], armSeen.lower,
         this._armUpper, this._armFore);
 
-      // Back of the arm: from the elbow crease to the point of the elbow.
-      // This is the roll a direction-only transfer leaves to the rest pose.
+      // Back of the UPPER arm: from the elbow crease to the point of the
+      // elbow. This is the roll a direction-only transfer leaves to the rest
+      // pose.
+      //
+      // It must be measured against the upper arm, not the forearm. Projecting
+      // it off the forearm makes the reference collapse exactly when the elbow
+      // bends 90 degrees (the crease line then runs along the forearm), and
+      // poseBone() has no choice but to invent a roll - which twists the whole
+      // arm sideways, a rotation no human elbow or shoulder can make.
       //
       // The two landmarks are only ~6 cm apart, and the reconstruction is far
       // less sure of their relative depth than of their position in the image,
@@ -1765,14 +1826,43 @@ export class MocapRetargeter {
       // a clean sample twists the arm fully, a noisy one falls back to
       // "back of the arm faces away from the chest" instead of shaking. A
       // landmark pair outside the frame is invented, so it has no say at all.
-      let armBack = this._t2.copy(shoulderFwd).negate();
+      const armBack = this._armBack.copy(shoulderFwd).negate();
+      armBack.addScaledVector(this._armUpper, -armBack.dot(this._armUpper));
+      // An arm reached straight along the chest's forward axis is parallel to
+      // that reference, so it has no perpendicular part left to read a roll
+      // from; poseBone() would then fall back to a world axis and snap the arm
+      // a quarter turn as the hand crosses in front of the chest. Follow the
+      // previous frame's roll instead, so the roll it arrived with is kept.
+      //
+      // Even away from that pose the reference only fixes the roll up to a
+      // sign: its projection turns antiparallel once the arm crosses the plane
+      // perpendicular to it, which would spin the whole arm half a turn. Keep
+      // the hemisphere the roll arrived in, so crossing that plane turns the
+      // arm instead of twisting it.
+      const backPrev = this._armBackP[side];
+      if (this._armBackOk[side]) {
+        if (armBack.lengthSq() < 1e-2) {
+          armBack.copy(backPrev).addScaledVector(this._armUpper,
+            -backPrev.dot(this._armUpper));
+        } else if (armBack.dot(backPrev) < 0) {
+          armBack.negate();
+        }
+      }
+      if (armBack.lengthSq() < 1e-8) {
+        // First frame at the singularity: body up is the exact limit of the
+        // torso reference for a forward reach, and stable for the short time
+        // before a real sample arrives.
+        armBack.copy(up).addScaledVector(this._armUpper,
+          -up.dot(this._armUpper));
+      }
+      if (armBack.lengthSq() < 1e-8) armBack.copy(shoulderFwd).negate();
       const olec = this.lm(`${p}_olecranon`);
       const cub = this.lm(`${p}_cubital`);
       if (olec && cub) {
         const crease = this._t4.copy(olec).sub(cub);
         const total = crease.length();
         if (total > 1e-4) {
-          crease.addScaledVector(this._armFore, -crease.dot(this._armFore));
+          crease.addScaledVector(this._armUpper, -crease.dot(this._armUpper));
           const perp = crease.length();
           const trust = clamp((perp / total - 0.3) / 0.45, 0, 1) *
             armSeen.upper * armSeen.lower;
@@ -1784,8 +1874,36 @@ export class MocapRetargeter {
         }
       }
 
+      // The elbow is a hinge: pull a wrist the reconstruction put outside the
+      // joint's range back to the nearest direction a human arm can reach
+      // before the forearm roll is derived from that (now legal) bend.
+      this.limitElbow(this._armUpper, this._armFore, armBack, this._armFore);
+
+      // Back of the FOREARM: an elbow is a hinge, so the forearm has no roll
+      // of its own to measure - it inherits the upper arm's roll plus the
+      // flexion. Rotating the upper arm's back reference by the elbow bend
+      // gives the anatomically possible answer at every flexion angle,
+      // including the 90-degree pose that used to collapse to an arbitrary
+      // sideways twist. Pronation/supination is a spin about the forearm and
+      // does not move this reference, so it is unaffected.
+      const foreBack = this._armForeBack.copy(armBack);
+      this._fQa.setFromUnitVectors(this._armUpper, this._armFore);
+      foreBack.applyQuaternion(this._fQa);
+      foreBack.addScaledVector(this._armFore, -foreBack.dot(this._armFore));
+      // A perfectly straight elbow leaves the bend undefined but the roll it
+      // already has, which is the upper arm's.
+      if (foreBack.lengthSq() < 1e-8) foreBack.copy(armBack);
+      foreBack.normalize();
+
+      backPrev.copy(armBack);
+      backPrev.addScaledVector(this._armUpper, -backPrev.dot(this._armUpper));
+      if (backPrev.lengthSq() > 1e-8) {
+        backPrev.normalize();
+        this._armBackOk[side] = true;
+      }
+
       this.poseBone(`${side}UpperArm`, this._armUpper, armBack, w);
-      this.poseBone(`${side}LowerArm`, this._armFore, armBack, w);
+      this.poseBone(`${side}LowerArm`, this._armFore, foreBack, w);
 
       // Hand: the wrist -> middle knuckle direction transfers wrist flex; the
       // roll follows the forearm. A wrist outside the frame has no knuckle to
@@ -1804,7 +1922,7 @@ export class MocapRetargeter {
           this._armKnuck.copy(this._armFore);
         }
       }
-      this.poseBone(`${side}Hand`, this._armKnuck, armBack, w);
+      this.poseBone(`${side}Hand`, this._armKnuck, foreBack, w);
 
       // Legs: the front of the thigh and shin follows the torso. A leg the
       // camera cannot see is a leg the reconstruction invented, and it invents
@@ -2066,6 +2184,7 @@ export class MocapRetargeter {
     for (const side of ['left', 'right']) {
       this._armSeen[side].upper = 1;
       this._armSeen[side].lower = 1;
+      this._armBackOk[side] = false;
     }
     this._crop = 0;
     this._cropQw.identity();
