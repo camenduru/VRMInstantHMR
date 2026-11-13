@@ -3,7 +3,7 @@
 https://github.com/user-attachments/assets/8ca77755-3cdf-4692-8672-13d2b8694167
 
 A small standalone app that turns a **video or a camera** into a **VRM avatar
-driven in real time** by [InstantHMR](https://github.com/momolesang/InstantHMR)
+driven in real time** by [InstantHMR](https://github.com/Naturalpad-studio/InstantHMR)
 3D body reconstruction. There is no bake step, no audio and no 2D fallback
 tracker: the only motion source is the live 3D worker.
 
