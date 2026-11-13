@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # ---------------------------------------------------------------------------
-# camenduru/VRMInstantHMR - fully self-contained image.
+# camenduru/vrminstanthmr - fully self-contained image.
+# Published on Docker Hub; the name must be lowercase.
 #
 # Everything is baked in; nothing is downloaded at runtime:
 #   * the app + the three.js bundle, compiled here from web/
@@ -14,28 +15,33 @@
 # HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE are set in the final image, so a
 # missing weight fails loudly instead of silently reaching for the network.
 #
+# Run the published image (UI on http://localhost:8010):
+#   docker pull camenduru/vrminstanthmr:latest
+#   docker run --rm -it --gpus all -p 8010:8010 \
+#     -v "$PWD/videos:/app/videos" camenduru/vrminstanthmr:latest
+#
 # Build (from this repository's root):
-#   docker build -t camenduru/VRMInstantHMR .
+#   docker build -t camenduru/vrminstanthmr:latest .
 #
 # Smaller build, default detector + default model only:
-#   docker build -t camenduru/VRMInstantHMR \
+#   docker build -t camenduru/vrminstanthmr \
 #     --build-arg INSTANTHMR_VARIANTS="medium" \
 #     --build-arg RFDETR_VARIANTS="medium" .
 #
 # Run (GPU, UI on http://localhost:8010):
-#   docker run --rm -it --gpus all -p 8010:8010 camenduru/VRMInstantHMR
+#   docker run --rm -it --gpus all -p 8010:8010 camenduru/vrminstanthmr:latest
 #
 # Run on CPU (slower, no --gpus):
-#   docker run --rm -it -p 8010:8010 camenduru/VRMInstantHMR
+#   docker run --rm -it -p 8010:8010 camenduru/vrminstanthmr:latest
 #
 # Camera input needs a device passthrough:
 #   docker run --rm -it --gpus all -p 8010:8010 --device /dev/video0 \
-#     camenduru/VRMInstantHMR
+#     camenduru/vrminstanthmr:latest
 #
 # Push:
-#   docker push camenduru/VRMInstantHMR:latest
+#   docker push camenduru/vrminstanthmr:latest
 #
-# Expect a ~9-11 GB image with every model, ~6-7 GB with the trimmed build.
+# Expect a 16.2 GB image with every model; the trimmed build is smaller.
 # ---------------------------------------------------------------------------
 
 # ---- frontend: build the three.js bundle from source ----------------------

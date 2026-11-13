@@ -67,8 +67,9 @@ Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
 
 ## Docker
 
-`Dockerfile` builds a self-contained image, `camenduru/VRMInstantHMR`, in which
-**nothing is downloaded when the container runs**. The build bakes in:
+The image is published on Docker Hub as **`camenduru/vrminstanthmr`**. It is
+self-contained: **nothing is downloaded when the container runs**. The build
+bakes in:
 
 | What | Where |
 | --- | --- |
@@ -78,29 +79,92 @@ Videos come from `InstantHMRApp/videos/` (uploads land there) and from any
 | RF-DETR detector weights | `/opt/roboflow` — all five variants |
 | avatar + idle animation | `/app/vrm_models` |
 
+### Run it from Docker Hub
+
 ```bash
-docker build -t camenduru/VRMInstantHMR .
-docker run --rm -it --gpus all -p 8010:8010 camenduru/VRMInstantHMR
+docker pull camenduru/vrminstanthmr:latest
+
+# GPU (needs the NVIDIA Container Toolkit)
+docker run --rm -it --gpus all -p 8010:8010 --name vrminstanthmr \
+  camenduru/vrminstanthmr:latest
 ```
 
-Open **http://localhost:8010**. Without a GPU drop `--gpus all`; the worker
-falls back to the CPU. For a camera, add `--device /dev/video0`.
+Open **http://localhost:8010**. The container listens on `0.0.0.0` and shows
+`(healthy)` in `docker ps` once `/api/status` answers. Add `-d` to run detached,
+then `docker logs -f vrminstanthmr` for the worker's own output; the page's
+**InstantHMR 3D** line reads `CUDAExecutionProvider` when the GPU was picked up.
+Without a GPU drop `--gpus all` — the same image falls back to the CPU, just
+slower.
+
+**A fresh container has no clips.** `/app/videos` ships empty, so the app starts
+on `camera:0`; with no `/dev/video0` passed through that camera cannot open and
+the bottom-right preview stays blank. Either add a clip in the page
+(**Add video…** uploads into the container's `/app/videos` and switches to it,
+but `--rm` discards it on exit) or mount a folder:
+
+| Mount | Effect |
+| --- | --- |
+| `-v "$PWD/videos:/app/videos"` | clips are listed at start, the first is selected, uploads survive |
+| `-v "$PWD/vrm_models:/app/vrm_models"` | your own `.vrm` / `.vrma` appear in **Load VRM…** |
+| `--device /dev/video0` | a real camera as `camera:0` |
+
+On Windows quote the host path instead: `-v "%cd%\videos:/app/videos"`.
+
+The image's `CMD` already carries `--host 0.0.0.0 --port 8010`, and `docker run`
+*replaces* a `CMD` rather than appending to it, so pinning an input at startup
+means repeating the command:
+
+```bash
+docker run --rm -it --gpus all -p 8010:8010 \
+  -v "$PWD/videos:/app/videos" camenduru/vrminstanthmr:latest \
+  /opt/app/bin/python -m app.server --host 0.0.0.0 --port 8010 \
+  --source "video:clip.mp4"
+```
+
+Otherwise just pick the clip in the **Input** menu.
+
+### Build it yourself
+
+```bash
+docker build -t camenduru/vrminstanthmr:latest .
+docker run --rm -it --gpus all -p 8010:8010 camenduru/vrminstanthmr:latest
+```
+
+The name must be lowercase — Docker Hub rejects `camenduru/VRMInstantHMR` as an
+invalid reference, which is why every command here uses
+`camenduru/vrminstanthmr`.
+
+A full build is **16.2 GB** (context ~250 MB) and takes roughly ten minutes on a
+warm cache: `COPY . /app/` sits above the Python environments, the InstantHMR
+checkout and the weight downloads, so any source edit redoes those layers. To
+trim it, keep only what you will actually select in the UI — the app defaults to
+`--model medium --fit 2 --detector medium`, so keep those:
+
+```bash
+docker build -t camenduru/vrminstanthmr \
+  --build-arg INSTANTHMR_VARIANTS="medium" \
+  --build-arg RFDETR_VARIANTS="medium" .
+```
+
+### Push
+
+```bash
+docker login
+docker build -t camenduru/vrminstanthmr:latest .
+docker push camenduru/vrminstanthmr:latest
+```
+
+Only layers the Hub does not already have are uploaded, so a rebuild that
+touches the app code pushes a few layers and a new manifest rather than all
+16 GB. Tag a version as well if you want a fixed reference:
+`docker tag camenduru/vrminstanthmr:latest camenduru/vrminstanthmr:1.0` and push
+both tags.
 
 `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` are set in the image, so a
 weight that failed to bake raises instead of being fetched — the "no runtime
 download" guarantee is enforced, not just intended. The build ends with checks
 that resolve `medium`/fit2 and construct `RFDETRMedium()` with the network
 switched off.
-
-The full build is ~9-11 GB (context ~250 MB). To trim it, keep only what you
-will actually select in the UI — the app defaults to `--model medium --fit 2
---detector medium`, so keep those:
-
-```bash
-docker build -t camenduru/VRMInstantHMR \
-  --build-arg INSTANTHMR_VARIANTS="medium" \
-  --build-arg RFDETR_VARIANTS="medium" .
-```
 
 `feet/` and `filters/` are the upstream reference implementations the
 retargeter was ported from. They are documentation, never imported at runtime,

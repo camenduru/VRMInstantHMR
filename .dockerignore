@@ -1,4 +1,4 @@
-# Build context for camenduru/VRMInstantHMR.
+# Build context for camenduru/vrminstanthmr.
 #
 # Kept: app/, scripts/, vrm_models/, videos/, web sources, requirements.txt.
 # Everything the image needs at runtime is either here or fetched and pinned
