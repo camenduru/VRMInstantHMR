@@ -206,6 +206,17 @@ const AXIS_Z = new THREE.Vector3(0, 0, 1);
 // so this clips only what a body cannot do. Kept in the file's measured style.
 const ROLL_MAX_RATE = 12.2;
 
+// Leg separation (see separateLegs). The solve answers "how far would this leg
+// have to swing to clear its twin", and that answer is a measurement like any
+// other: it arrives with the frame's noise, and when a crossing starts or ends
+// it changes by tens of centimetres in one frame. Applied raw, that read as the
+// legs popping. So the correction is smoothed towards the solve's answer and
+// rate-limited on the way, which also means it decays to nothing instead of
+// snapping off when the legs stop crossing.
+const TAU_SEPARATE = 0.09;      // seconds to take up a new correction
+const SEPARATE_RATE = 1.5;      // rad/s the correction may change
+const SEPARATE_STEP = 0.06;     // rad, and at most this much in one frame
+
 /**
  * How far a bone may be rolled about its own axis, in radians, measured from
  * the roll a pure swing carries (the neutral internal/external rotation).
@@ -477,6 +488,50 @@ export class MocapRetargeter {
     // update3D), so the hemisphere it arrived in is remembered per foot.
     this._footUpP = { left: new THREE.Vector3(), right: new THREE.Vector3() };
     this._footUpOk = { left: false, right: false };
+    // Leg-on-leg clearance (see separateLegs): how much of each leg the shot
+    // shows, one hip-knee-ankle-toe chain per side, the closest points of a
+    // colliding pair, and the swing that moves a leg out of the way.
+    this._legWav = { left: 1, right: 1 };
+    // The leg roll references (see the leg block in update3D): the thigh's own
+    // front carried into world space, and the same carried through the knee.
+    this._legRef = new THREE.Vector3();
+    this._legRef2 = new THREE.Vector3();
+    this._legQ = new THREE.Quaternion();
+    this._sep = {
+      hip: { left: new THREE.Vector3(), right: new THREE.Vector3() },
+      knee: { left: new THREE.Vector3(), right: new THREE.Vector3() },
+      ankle: { left: new THREE.Vector3(), right: new THREE.Vector3() },
+      toe: { left: new THREE.Vector3(), right: new THREE.Vector3() },
+    };
+    this._sepC1 = new THREE.Vector3();
+    this._sepC2 = new THREE.Vector3();
+    this._segD1 = new THREE.Vector3();
+    this._segD2 = new THREE.Vector3();
+    this._sepR = new THREE.Vector3();
+    this._sepPush = new THREE.Vector3();
+    this._sepPerp = new THREE.Vector3();
+    this._sepAxis = new THREE.Vector3();
+    this._sepQ = new THREE.Quaternion();
+    this._sepQp = new THREE.Quaternion();
+    this._sepQc = new THREE.Quaternion();
+    this._sepQW = new THREE.Quaternion();
+    this._sepQT = new THREE.Quaternion();
+    // The pose the legs were aimed into before any separation, and the world
+    // rotation each thigh is currently applying relative to it. The solve is
+    // measured against the natural pose and the applied correction is smoothed,
+    // so the two are kept apart. The shin and the shoe below the swung femur
+    // are pinned back to this same snapshot (see applyLegSwing).
+    this._sepNatW = { left: new THREE.Quaternion(), right: new THREE.Quaternion() };
+    this._sepNatQ = {
+      left: { upperInv: new THREE.Quaternion(), lower: new THREE.Quaternion(), foot: new THREE.Quaternion() },
+      right: { upperInv: new THREE.Quaternion(), lower: new THREE.Quaternion(), foot: new THREE.Quaternion() },
+    };
+    this._sepApp = { left: new THREE.Quaternion(), right: new THREE.Quaternion() };
+    this._sepAppOk = { left: false, right: false };
+    this._sepQNet = new THREE.Quaternion();
+    this._sepQNext = new THREE.Quaternion();
+    this._sepQInv = new THREE.Quaternion();
+    this._sepQDelta = new THREE.Quaternion();
     // Last forearm direction limitElbow() actually applied, per side. The
     // reconstruction's wrist can jump a long way at the poses where the arm
     // crosses the chest, so the applied direction is slew limited against this
@@ -1632,6 +1687,286 @@ export class MocapRetargeter {
   }
 
   /**
+   * Closest points of two segments, into `c1`/`c2`; returns their distance.
+   * Standard endpoint-clamped solution (Ericson), no allocation.
+   */
+  closestSegSeg(p1, q1, p2, q2, c1, c2) {
+    const d1 = this._segD1.copy(q1).sub(p1);
+    const d2 = this._segD2.copy(q2).sub(p2);
+    const r = this._sepR.copy(p1).sub(p2);
+    const a = d1.dot(d1);
+    const e = d2.dot(d2);
+    const f = d2.dot(r);
+    let s = 0;
+    let t = 0;
+    if (a <= 1e-12 && e <= 1e-12) {
+      // both segments are points: the endpoints already are the answer
+    } else if (a <= 1e-12) {
+      t = clamp(f / e, 0, 1);
+    } else if (e <= 1e-12) {
+      s = clamp(-d1.dot(r) / a, 0, 1);
+    } else {
+      const c = d1.dot(r);
+      const b = d1.dot(d2);
+      const den = a * e - b * b;
+      s = den > 1e-12 ? clamp((b * f - c * e) / den, 0, 1) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) {
+        t = 0;
+        s = clamp(-c / a, 0, 1);
+      } else if (t > 1) {
+        t = 1;
+        s = clamp((b - c) / a, 0, 1);
+      }
+    }
+    c1.copy(p1).addScaledVector(d1, s);
+    c2.copy(p2).addScaledVector(d2, t);
+    return c1.distanceTo(c2);
+  }
+
+  /**
+   * Premultiply a world-space rotation onto one thigh, carrying the shin with
+   * it and leaving the shoe exactly where it was.
+   *
+   * A swing about the hip is the only rotation that translates the knee: the
+   * knee is the femur's child, so the femur's orientation decides where the
+   * whole chain below it hangs. The knee - and with it the shin, the ankle and
+   * the foot - moves as a unit, which is what pushes a crossed calf out of its
+   * twin.
+   *
+   * What the swing must not change: the shoe keeps the sole it was given.
+   * Without this the femur's swing is carried into the foot, and fixing a 6 cm
+   * overlap pitched the sole several degrees - the one thing the foot pass had
+   * just got right.
+   *
+   * Everything between the hip and the shoe moves rigidly, as one piece. That
+   * is what a leg does: a hip rotation carries the knee angle with it. The
+   * earlier version pinned the SHIN in world space instead, which left the
+   * shin pointing where it had been while the femur swung away from it - and
+   * that is a knee bending 25 degrees out of its own hinge, every time the
+   * correction grew. The shoe still ends up where it was aimed; the ankle
+   * takes the swing, which is the joint that can.
+   */
+  applyLegSwing(side, rot) {
+    const bone = this.b[`${side}UpperLeg`];
+    const lower = this.b[`${side}LowerLeg`];
+    const foot = this.b[`${side}Foot`];
+    if (!bone) return false;
+    bone.parent.getWorldQuaternion(this._sepQp);
+    this._sepQc.copy(this._sepQp).invert().multiply(rot)
+      .multiply(this._sepQp).multiply(bone.quaternion);
+    bone.quaternion.copy(this._sepQc).normalize();
+    bone.updateWorldMatrix(false, true);
+    const keep = this._sepNatQ[side];
+    if (lower && foot && keep) {
+      // The rotation the femur has accumulated since the snapshot, applied to
+      // the shin as well: `rot` alone is only this call's increment, and the
+      // solve can make several.
+      bone.getWorldQuaternion(this._sepQW);
+      this._sepQW.multiply(keep.upperInv);
+      this._sepQT.multiplyQuaternions(this._sepQW, keep.lower);
+      lower.parent.getWorldQuaternion(this._sepQp);
+      lower.quaternion.copy(this._sepQp).invert().multiply(this._sepQT).normalize();
+      lower.updateWorldMatrix(false, true);
+      foot.parent.getWorldQuaternion(this._sepQp);
+      foot.quaternion.copy(this._sepQp).invert().multiply(keep.foot).normalize();
+      foot.updateWorldMatrix(false, true);
+    }
+    return true;
+  }
+
+  /**
+   * Swing one whole leg about its hip so that `point` on it moves `amount`
+   * metres along `dir`, without twisting the femur.
+   */
+  swingLeg(side, point, dir, sign, amount) {
+    if (amount <= 1e-5) return false;
+    const hip = this._sep.hip[side];
+    const r = this._sepR.copy(point).sub(hip);
+    const len = r.length();
+    if (len < 1e-4) return false;
+    // A point right next to the hip cannot be moved by swinging about the hip;
+    // asking for a large angle there only throws the knee sideways. Give every
+    // point at least a third of the knee's lever arm, so a correction aimed at
+    // the top of a thigh stays a correction and never becomes a kick.
+    const lever = Math.max(len, 0.3 * this._sep.hip[side].distanceTo(this._sep.knee[side]));
+    // only the part of the requested motion perpendicular to the lever arm is
+    // reachable by a rotation - the rest would lengthen the femur
+    const perp = this._sepPerp.copy(dir).multiplyScalar(sign);
+    perp.addScaledVector(r, -perp.dot(r) / (len * len));
+    if (perp.lengthSq() < 1e-10) return false;
+    perp.normalize();
+    const axis = this._sepAxis.crossVectors(r, perp).normalize();
+    const angle = Math.min(0.45, amount / lever);
+    this._sepQ.setFromAxisAngle(axis, angle);
+    return this.applyLegSwing(side, this._sepQ);
+  }
+
+  /**
+   * Keep the two legs out of each other.
+   *
+   * Nothing in the retargeter ever noticed when the legs met: each is aimed
+   * independently from a pelvis whose hip joints are a fixed distance apart, so
+   * two limbs that are legal on their own can still occupy the same space. The
+   * live feed makes that easy to reach: crossed in front of each other, the
+   * person's legs stay 10.8 cm apart (p10) while this avatar's own crossing -
+   * the same limb DIRECTIONS on a pelvis 2 cm narrower, with legs 10% shorter -
+   * came down to 7.0 cm. One calf three centimetres inside the other is the
+   * "legs pass through each other" the viewer sees, and no joint is at fault.
+   *
+   * The table below is how much room each pair of bones needs, as a share of
+   * the avatar's own hip separation. The two femurs are exactly one hip
+   * separation apart where they leave the pelvis - which is where their skin
+   * meets - and need only their own thickness further down. A shin is about two
+   * thirds as thick, and the shoes are wider than the ankles.
+   *
+   * Only a pair that is already inside each other is touched, and only by the
+   * amount it is inside: an ordinary pose is left exactly as measured. The
+   * push is shared between the legs in proportion to how much of each the shot
+   * shows, so a leg the camera cannot see - which is pinned to a rest pose by
+   * legDir() - is not swung around to make room for one that is real.
+   *
+   * The size of that push is re-measured every frame and is not itself smooth,
+   * so what the bones receive is a smoothed and rate-limited version of it
+   * (TAU_SEPARATE, SEPARATE_RATE). The correction therefore eases in as a
+   * crossing begins and eases out as it ends, instead of appearing and
+   * vanishing between two frames.
+   */
+  separateLegs(dt) {
+    const b = this.b;
+    const sep = this._sep;
+    if (!b.leftUpperLeg || !b.rightUpperLeg || !b.leftFoot || !b.rightFoot ||
+        !b.leftToes || !b.rightToes) return;
+    if (!(dt > 0)) return;
+
+    const sample = () => {
+      for (const s of ['left', 'right']) {
+        b[`${s}UpperLeg`].getWorldPosition(sep.hip[s]);
+        b[`${s}LowerLeg`].getWorldPosition(sep.knee[s]);
+        b[`${s}Foot`].getWorldPosition(sep.ankle[s]);
+        b[`${s}Toes`].getWorldPosition(sep.toe[s]);
+      }
+    };
+    sample();
+    const hipW = sep.hip.left.distanceTo(sep.hip.right);
+    if (hipW < 1e-4) return;
+
+    // The pose the legs were aimed into, before this pass touches them. The
+    // solve below starts from it every frame, so the correction it asks for is
+    // always measured against the same thing - which is what lets that
+    // correction be smoothed over time without the pose drifting.
+    for (const s of ['left', 'right']) {
+      b[`${s}UpperLeg`].getWorldQuaternion(this._sepNatW[s]);
+      b[`${s}LowerLeg`].getWorldQuaternion(this._sepNatQ[s].lower);
+      b[`${s}Foot`].getWorldQuaternion(this._sepNatQ[s].foot);
+      this._sepNatQ[s].upperInv.copy(this._sepNatW[s]).invert();
+    }
+
+    // [clearance as a share of the hip separation, this leg's bone, that leg's,
+    //  optional: the share of the bone length inside which a closest point
+    //  cannot be moved and is left alone]
+    //
+    // Thigh against thigh carries that last number. Both femurs start a hip
+    // separation apart, so where they are closest right under the pelvis a
+    // swing about the hip cannot move them at all: the point IS the hip. Asking
+    // for a correction there only turns a millimetre of overlap into a knee
+    // thrown ten centimetres sideways, which is why this pair used to be left
+    // out entirely. Halfway down the femur, though, a swing does move the bone,
+    // and that is where the two thighs cross and visibly pass through each
+    // other; so the pair is solved only where both closest points are out on
+    // the bone, and the crotch is left to the pelvis and the skirt.
+    const pairs = [
+      [0.74, 'upper', 'upper', 0.3],
+      [0.82, 'upper', 'lower'],
+      [0.76, 'lower', 'lower'],
+      [0.72, 'lower', 'foot'],
+      [0.80, 'foot', 'foot'],
+    ];
+    const ends = (s, part) => (part === 'upper'
+      ? [sep.hip[s], sep.knee[s]]
+      : part === 'lower' ? [sep.knee[s], sep.ankle[s]]
+        : [sep.ankle[s], sep.toe[s]]);
+    // where along a segment its closest point sits: 0 at the hip end, 1 at the
+    // far end
+    const frac = (c, a1, a2) => {
+      const d = this._segD1.copy(a2).sub(a1);
+      const l2 = d.lengthSq();
+      return l2 > 1e-12 ? clamp(this._segD2.copy(c).sub(a1).dot(d) / l2, 0, 1) : 0;
+    };
+
+    // How much of each leg may take the push. A leg the shot cannot see is
+    // pinned to a rest pose and must not be swung around to make room; a foot
+    // holding a stance has an anchor, and moving its leg drags that foot off
+    // the floor. Neither is off limits - leaving the legs inside each other is
+    // worse - but both give way to the leg that is free to move.
+    const planted = (s) => (this.footIK
+      ? clamp(this.footIK._prevW[s] || 0, 0, 1) : 0);
+    const wl = clamp(this._legWav.left, 0, 1) * (1 - 0.75 * planted('left'));
+    const wr = clamp(this._legWav.right, 0, 1) * (1 - 0.75 * planted('right'));
+    const shareL = wl + wr > 1e-3 ? wl / (wl + wr) : 0.5;
+
+    for (let it = 0; it < 4; it++) {
+      let moved = false;
+      for (let i = 0; i < pairs.length; i++) {
+        const [k, pa, pb, minFrac] = pairs[i];
+        const clear = k * hipW;
+        const [a1, a2] = ends('left', pa);
+        const [b1, b2] = ends('right', pb);
+        const d = this.closestSegSeg(a1, a2, b1, b2, this._sepC1, this._sepC2);
+        if (d >= clear || d < 1e-5) continue;
+        let shareA = shareL;
+        let shareB = 1 - shareL;
+        if (minFrac !== undefined) {
+          const fa = frac(this._sepC1, a1, a2);
+          const fb = frac(this._sepC2, b1, b2);
+          if (fa < minFrac) shareA = 0;
+          if (fb < minFrac) shareB = 0;
+          if (shareA + shareB < 1e-3) continue;
+        }
+        const deficit = clear - d;
+        this._sepPush.copy(this._sepC2).sub(this._sepC1).divideScalar(d);
+        // left leg away from the right leg, and the right leg the other way
+        moved = this.swingLeg('left', this._sepC1, this._sepPush, -1,
+          deficit * shareA) || moved;
+        moved = this.swingLeg('right', this._sepC2, this._sepPush, 1,
+          deficit * shareB) || moved;
+      }
+      if (!moved) break;
+      sample();
+    }
+
+    // The solve is instantaneous and its answer is noisy - it jumps when a
+    // crossing begins, when the closest points slide from one bone pair to
+    // another, and when the plant IK releases a leg. Each thigh therefore keeps
+    // the world rotation it has been applying relative to the natural pose and
+    // moves towards this frame's answer by a smoothed, rate-limited step. With
+    // nothing to solve the answer is the identity, so the correction eases out
+    // instead of snapping off.
+    for (const s of ['left', 'right']) {
+      b[`${s}UpperLeg`].getWorldQuaternion(this._sepQNet);
+      this._sepQInv.copy(this._sepNatW[s]).invert();
+      this._sepQNet.premultiply(this._sepQInv);
+      if (!this._sepAppOk[s]) {
+        this._sepApp[s].identity();
+        this._sepAppOk[s] = true;
+      }
+      let t = damp(dt, TAU_SEPARATE);
+      const angle = this._sepApp[s].angleTo(this._sepQNet);
+      // A dropped frame must not buy the correction a bigger step than a
+      // normal one would: the limit is per frame as well as per second.
+      const maxStep = Math.min(SEPARATE_RATE * dt, SEPARATE_STEP);
+      if (angle > maxStep) t = Math.min(t, maxStep / angle);
+      this._sepQNext.copy(this._sepApp[s]).slerp(this._sepQNet, t);
+      this._sepApp[s].copy(this._sepQNext);
+      // from the solved pose (already corrected by the full answer) to the
+      // smoothed one
+      this._sepQInv.copy(this._sepQNet).invert();
+      this._sepQDelta.multiplyQuaternions(this._sepQNext, this._sepQInv);
+      this.applyLegSwing(s, this._sepQDelta);
+    }
+  }
+
+  /**
    * An arm bone's direction, blended toward a resting pose the shot can see.
    *
    * `weight` is how much of that arm segment the camera can see (1 = all of
@@ -2130,13 +2465,40 @@ export class MocapRetargeter {
       // a crouch; a hidden leg standing straight under its hip is both the
       // likelier truth and the only stance that cannot leave the avatar folded
       // in mid air with its feet off the floor.
+      //
+      // The roll reference, though, is not the torso. A thigh that swings
+      // forward carries its own front with it, so holding that front to a world
+      // direction asks the hip for internal rotation it never made - and the
+      // chest forward moves 18 degrees in a single frame at p99, which the legs
+      // then followed as a roll. Measured on the live feed that was the fastest
+      // motion in either leg (22 degrees per frame at p99, 29 at worst) while
+      // the person's own thigh moved 1-3. The knee is a hinge, so the plane it
+      // actually bends in is the only roll either bone has: the thigh's front
+      // faces away from the measured shin, and the shin has no roll of its own -
+      // it inherits the thigh's, carried through the bend, exactly like the
+      // forearm inherits the shoulder's.
       const legW = this._legSeen[p];
-      this.poseBone(`${side}UpperLeg`,
-        this.legDir(SMPL[`${p}Hip`], SMPL[`${p}Knee`], legW, this._t5),
-        shoulderFwd, w);
-      this.poseBone(`${side}LowerLeg`,
-        this.legDir(SMPL[`${p}Knee`], SMPL[`${p}Ankle`], legW, this._t6),
-        shoulderFwd, w);
+      this._legWav[side] = legW;
+      const femur = this.legDir(SMPL[`${p}Hip`], SMPL[`${p}Knee`], legW, this._t5);
+      const shin = this.legDir(SMPL[`${p}Knee`], SMPL[`${p}Ankle`], legW, this._t6);
+      // the knee bends BACKWARD, so the plane it bends in is the side the
+      // thigh's front faces away from
+      this.poseBone(`${side}UpperLeg`, femur, this._legRef2.copy(shin).negate(), w);
+      // the thigh's own front, in world space, as the renderer now has it
+      const thighRef = this._legRef
+        .copy(this._frames[`${side}UpperLeg`].ref)
+        .applyQuaternion(this.b[`${side}UpperLeg`]
+          .getWorldQuaternion(this._legQ));
+      thighRef.addScaledVector(femur, -thighRef.dot(femur));
+      if (thighRef.lengthSq() < 1e-8) thighRef.copy(shoulderFwd);
+      thighRef.normalize();
+      // carried through the bend: the hinge has no roll of its own
+      this._fQa.setFromUnitVectors(femur, shin);
+      const shinRef = this._legRef2.copy(thighRef).applyQuaternion(this._fQa);
+      shinRef.addScaledVector(shin, -shinRef.dot(shin));
+      if (shinRef.lengthSq() < 1e-8) shinRef.copy(thighRef);
+      shinRef.normalize();
+      this.poseBone(`${side}LowerLeg`, shin, shinRef, w);
 
       // Foot: ankle, toe and heel form a triangle whose lateral normal, crossed
       // with the sole line, gives the sole's upward normal (foot roll).
@@ -2298,6 +2660,10 @@ export class MocapRetargeter {
     this._applyOutputFilter(dt);
     this._floorClamp(this._floorSample(ground));
     this._plantFeet(dt, weight, ground);
+    // The legs are aimed and planted; the one thing no bone solved for is
+    // whether the two are inside each other, and the plant IK is entitled to
+    // rewrite a leg, so this has to run after it.
+    this.separateLegs(dt);
     this._floorClamp(this._floorSample(ground));
   }
 
@@ -2423,12 +2789,16 @@ export class MocapRetargeter {
     this._trim = 0;
     this._legSeen.left = 1;
     this._legSeen.right = 1;
+    this._legWav.left = 1;
+    this._legWav.right = 1;
     for (const side of ['left', 'right']) {
       this._armSeen[side].upper = 1;
       this._armSeen[side].lower = 1;
       this._armBackOk[side] = false;
       this._foreDirOk[side] = false;
       this._footUpOk[side] = false;
+      this._sepApp[side].identity();
+      this._sepAppOk[side] = false;
     }
     this._crop = 0;
     this._cropQw.identity();
@@ -2456,6 +2826,10 @@ export class MocapRetargeter {
       this.footIK.corr.right.set(0, 0);
       this.footIK._prevW.left = 0;
       this.footIK._prevW.right = 0;
+      // The applied correction is state: after a reset the bones are re-posed
+      // from scratch, so carrying it would put a stale rotation on a new pose.
+      this.footIK.corrQ.left.ok = false;
+      this.footIK.corrQ.right.ok = false;
     }
   }
 }

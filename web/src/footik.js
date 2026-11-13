@@ -83,9 +83,32 @@ const POLE_FULL = 0.06;
 // rather than tracked. Measured without this cap: the applied pole sat 40-90
 // degrees off the natural knee at full IK weight.
 const MAX_POLE_TWIST = 35;
-const COS_MAX_POLE = Math.cos(MAX_POLE_TWIST * Math.PI / 180);
-const SIN_MAX_POLE = Math.sin(MAX_POLE_TWIST * Math.PI / 180);
+// The cap is a BACKSTOP, and a backstop needs a reference that exists. `pNat`
+// is the person's own knee direction, which is only a direction while the knee
+// is bent: at the 1-2 cm offsets this reconstruction mostly reports it is
+// tracking noise (see POLE_FULL). Measured live, the two largest knee snaps of
+// a whole run - 15 and 19 degrees of applied pole in a single call, 75 at the
+// worst - were this cap projecting the pole onto a cone around a knee that was
+// only 1.2 cm off the hip->ankle line. So the cap only applies where the plane
+// is real, and it is SOFT: it starts bending the pole back at three quarters of
+// the limit and approaches the limit asymptotically, so no frame can cross it.
+const MAX_POLE_RAD = MAX_POLE_TWIST * Math.PI / 180;
+const MAX_POLE_KNEE = MAX_POLE_RAD * 0.75;
+const POLE_CAP_MIN = POLE_FULL * 0.5;  // m: knee offset below which the plane is noise
 const MAX_SLEW = 0.3;         // m/s: how fast the correction may shrink on release
+// How fast the IK's own correction may rotate a leg. The correction is measured
+// in METRES, but what the viewer sees is a joint angle, and near full extension
+// the two are wildly non-linear: measured live, a 3.8 cm change in the
+// correction moved the thigh 14 degrees and the shin 10 in a single frame while
+// the person's own leg moved 1-3. A low-pass in metres cannot bound that - the
+// same centimetre is worth 2 degrees on a bent leg and 30 on a straight one -
+// so the applied correction is limited in the space it is actually seen in.
+// 240 deg/s is a fast, deliberate joint motion; the worst measured frame before
+// this was ~420 deg/s, and the source footage peaks near 300.
+const CORR_RATE = 240;        // deg/s
+const CORR_STEP = 5;          // deg in a single call, so a long frame cannot buy more
+const CORR_TAU = 0.04;        // s: low-pass on the applied correction rotation
+const DEG = Math.PI / 180;
 // Fraction of the leg's reach the sideways hold may use. At 1.0 the solve
 // sits exactly on the straight-leg singularity whenever the correction is at
 // the cap; leaving a margin keeps the knee direction defined.
@@ -120,7 +143,6 @@ export class FootIK {
     this.pq = new THREE.Quaternion();
     this.loc = new THREE.Quaternion();
     this.qD = new THREE.Quaternion();
-    this.footQ = new THREE.Quaternion();
     /**
      * Smoothed correction (x, z) actually being applied, per side. This is
      * `anchor - ankle` at FULL weight; the weight is folded in before the
@@ -162,6 +184,26 @@ export class FootIK {
     this.applied = { left: 0, right: 0 };
     /** Weight at the previous call, to tell a held stance from a release. */
     this._prevW = { left: 0, right: 0 };
+    /**
+     * The rotation this pass is currently applying, per side and per bone, as a
+     * WORLD-space correction on top of the pose the reconstruction produced.
+     * `plant` re-derives that pose from scratch every frame, so a correction is
+     * only ever a rotation relative to it; keeping the applied one here lets it
+     * be rate-limited in degrees instead of metres (see CORR_RATE).
+     */
+    this.corrQ = {
+      left: { up: new THREE.Quaternion(), lo: new THREE.Quaternion(), ok: false },
+      right: { up: new THREE.Quaternion(), lo: new THREE.Quaternion(), ok: false },
+    };
+    /** The reconstruction's own pose this call, before any correction. */
+    this.natUp = new THREE.Quaternion();
+    this.natLo = new THREE.Quaternion();
+    this.natFoot = new THREE.Quaternion();
+    this.natUpInv = new THREE.Quaternion();
+    this.natLoInv = new THREE.Quaternion();
+    this.tgtUp = new THREE.Quaternion();
+    this.tgtLo = new THREE.Quaternion();
+    this.wQ = new THREE.Quaternion();
   }
 
   /**
@@ -214,6 +256,16 @@ export class FootIK {
     const lower = r.b[`${side}LowerLeg`];
     const foot = r.b[`${side}Foot`];
     if (!upper || !lower || !foot) return 0;
+
+    // The pose the reconstruction produced, before this pass touches anything.
+    // Every correction below is a rotation on top of it, and it is re-derived
+    // from scratch each call, so this is also what the applied correction is
+    // measured against (see _settle).
+    upper.getWorldQuaternion(this.natUp);
+    lower.getWorldQuaternion(this.natLo);
+    foot.getWorldQuaternion(this.natFoot);
+    this.natUpInv.copy(this.natUp).invert();
+    this.natLoInv.copy(this.natLo).invert();
 
     upper.getWorldPosition(this.H);
     lower.getWorldPosition(this.K);
@@ -321,11 +373,16 @@ export class FootIK {
     const ex = c.x;
     const ez = c.y;
     const mag = Math.hypot(ex, ez);
-    if (mag < DEAD) return 0;
+    if (mag < DEAD) {
+      // Nothing to solve - but the last correction is still on the bones and
+      // must be unwound at the same rate it was applied. Cutting it here is
+      // the pop this pass exists to avoid; letting _settle run with an
+      // identity target eases the leg back onto the reconstruction.
+      this._settle(side, upper, lower, foot, hh, false);
+      return 0;
+    }
 
     // The shoe keeps whatever orientation the reconstruction gave it.
-    foot.getWorldQuaternion(this.footQ);
-
     this.T.set(this.A.x + ex, this.A.y, this.A.z + ez);
     this.u.subVectors(this.T, this.H);
     let d = this.u.length();
@@ -460,26 +517,34 @@ export class FootIK {
         this.p.normalize();
       }
     }
-    // Hard anatomical cap. Whatever the smoothing did, the knee may not point
+    // Anatomical cap. Whatever the smoothing did, the knee may not point
     // further than a hip can rotate: past MAX_POLE_TWIST from the person's own
-    // knee the leg is visibly rolled off its joint. This is the backstop that
-    // makes an "impossible" leg impossible, and it is applied to the angle the
+    // knee the leg is visibly rolled off its joint. Applied to the angle the
     // solve actually uses, not to the stored pole, so a stale pole cannot leak
     // a twist through the KNEE_BLEND path either.
-    if (rawMag > 1e-6 && this.p.dot(this.pNat) < COS_MAX_POLE) {
-      this.poleTmp.copy(this.p).addScaledVector(this.pNat, -this.p.dot(this.pNat));
-      if (this.poleTmp.lengthSq() > 1e-8) {
-        this.poleTmp.normalize();
-        this.p.copy(this.pNat).multiplyScalar(COS_MAX_POLE)
-          .addScaledVector(this.poleTmp, SIN_MAX_POLE)
-          .normalize();
-        if (this.p.dot(fwd) < 0) {
-          this.p.addScaledVector(fwd, -2 * this.p.dot(fwd)).normalize();
+    //
+    // Two things keep the backstop from becoming a source of motion itself.
+    // It only runs where the person's knee plane is measurable at all
+    // (POLE_CAP_MIN), and it bends the pole back smoothly instead of
+    // projecting it onto the limit: the angle it leaves is continuous in the
+    // angle it receives, so a pole that drifts out past the limit keeps
+    // drifting out and is eased back, rather than snapping from one side of
+    // the cone to the other.
+    if (rawMag > POLE_CAP_MIN) {
+      const cosA = Math.max(-1, Math.min(1, this.p.dot(this.pNat)));
+      const th = Math.acos(cosA);
+      if (th > MAX_POLE_KNEE) {
+        const span = MAX_POLE_RAD - MAX_POLE_KNEE;
+        const out = MAX_POLE_KNEE +
+          span * (1 - Math.exp(-(th - MAX_POLE_KNEE) / span));
+        this.poleTmp.crossVectors(this.p, this.pNat);
+        if (this.poleTmp.lengthSq() > 1e-12) {
+          this.poleTmp.normalize();
+          this.p.applyAxisAngle(this.poleTmp, th - out);
+          if (this.p.dot(fwd) < 0) {
+            this.p.addScaledVector(fwd, -2 * this.p.dot(fwd)).normalize();
+          }
         }
-      } else {
-        // the pole was exactly opposite the natural knee: nothing but the knee
-        // itself is a sane direction
-        this.p.copy(this.pNat);
       }
     }
     this.pole[side].copy(this.p);
@@ -504,12 +569,70 @@ export class FootIK {
     this.qD.setFromUnitVectors(this.d1, this.d2);
     this._delta(lower, this.qD);
 
-    // Cancel the rotations the IK imposed on the shoe.
-    lower.getWorldQuaternion(this.pq);
-    foot.quaternion.copy(this.pq).invert().multiply(this.footQ);
-    foot.updateWorldMatrix(false, true);
+    // The solved pose is the target, not the answer: it is applied through the
+    // rate-limited correction, so a solve that suddenly wants 20 degrees cannot
+    // deliver them in one frame (see CORR_RATE).
+    this._settle(side, upper, lower, foot, hh, true);
 
     this.applied[side] = mag;
     return mag;
+  }
+
+  /**
+   * Apply this frame's correction, rate-limited in degrees.
+   *
+   * `solved` says whether the bones currently hold the solved pose (true) or
+   * the reconstruction's own pose (false, which is the case when the solve has
+   * nothing to do and the correction is being unwound).
+   *
+   * The correction is stored as a world-space rotation on top of the
+   * reconstruction's pose for the same reason the pole is stored in the hip's
+   * frame: a rotation in the body's own frame is what the leg is actually
+   * doing, and it survives the pose being re-derived every frame. Two limits
+   * are applied to it, and both are needed:
+   *
+   *   - a low-pass (CORR_TAU), so a noisy target does not become noisy motion;
+   *   - an angular rate (CORR_RATE, CORR_STEP), because the metre-space
+   *     correction that produces this rotation is not proportional to it. On a
+   *     leg at 95% extension the same centimetre is worth an order of magnitude
+   *     more joint angle than on a bent one, which is exactly how a 4 cm
+   *     change became 14 degrees of thigh in a single frame.
+   */
+  _settle(side, upper, lower, foot, dt, solved) {
+    const st = this.corrQ[side];
+    if (!st.ok) {
+      st.up.identity();
+      st.lo.identity();
+      st.ok = true;
+    }
+    if (solved) {
+      upper.getWorldQuaternion(this.tgtUp).multiply(this.natUpInv);
+      lower.getWorldQuaternion(this.tgtLo).multiply(this.natLoInv);
+    } else {
+      this.tgtUp.identity();
+      this.tgtLo.identity();
+    }
+    const k = damp(dt, CORR_TAU);
+    const maxStep = Math.min(CORR_RATE * dt, CORR_STEP) * DEG;
+    for (let i = 0; i < 2; i++) {
+      const cur = i ? st.lo : st.up;
+      const tgt = i ? this.tgtLo : this.tgtUp;
+      const ang = cur.angleTo(tgt);
+      let t = k;
+      if (ang > maxStep && ang > 1e-9) t = Math.min(t, maxStep / ang);
+      cur.slerp(tgt, t);
+    }
+    // Write the smoothed correction onto the reconstruction's pose.
+    this.wQ.multiplyQuaternions(st.up, this.natUp);
+    upper.parent.getWorldQuaternion(this.pq);
+    upper.quaternion.copy(this.pq).invert().multiply(this.wQ).normalize();
+    upper.updateWorldMatrix(false, true);
+    this.wQ.multiplyQuaternions(st.lo, this.natLo);
+    lower.parent.getWorldQuaternion(this.pq);
+    lower.quaternion.copy(this.pq).invert().multiply(this.wQ).normalize();
+    lower.updateWorldMatrix(false, true);
+    foot.parent.getWorldQuaternion(this.pq);
+    foot.quaternion.copy(this.pq).invert().multiply(this.natFoot).normalize();
+    foot.updateWorldMatrix(false, true);
   }
 }
