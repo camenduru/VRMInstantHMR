@@ -227,7 +227,15 @@ const ROLL_MAX_RATE = 12.2;
  * the wrist rolls about 60 degrees each way. The forearm is absent on purpose:
  * its reference is derived from the upper arm's, so its measured roll already
  * includes a large geometric offset, and clamping that would bend the elbow
- * out of its own hinge. Spine, legs and feet keep the full circle.
+ * out of its own hinge. Spine and legs keep the full circle.
+ *
+ * Feet are absent too, and for a different reason: their roll is measured
+ * against the swing that aims the bone, and a foot that kicks out behind the
+ * body turns that swing ~150 degrees, so the ankle is asked for a roll no ankle
+ * has even though the sole it is matching is correct. Clamping it there put the
+ * shoe 130 degrees off the measured sole. The foot's noise problem is the
+ * sole's SIGN, not its size, and that is handled where the reference is built
+ * (see the foot block in update3D).
  */
 const TWIST_LIMIT = {
   leftShoulder: 0, rightShoulder: 0,
@@ -465,6 +473,10 @@ export class MocapRetargeter {
     this._armForeBack = new THREE.Vector3();
     this._elbowU = new THREE.Vector3();
     this._elbowB = new THREE.Vector3();
+    // The sole's normal is only defined up to a sign (see the foot block in
+    // update3D), so the hemisphere it arrived in is remembered per foot.
+    this._footUpP = { left: new THREE.Vector3(), right: new THREE.Vector3() };
+    this._footUpOk = { left: false, right: false };
     // Last forearm direction limitElbow() actually applied, per side. The
     // reconstruction's wrist can jump a long way at the poses where the arm
     // crosses the chest, so the applied direction is slew limited against this
@@ -2129,6 +2141,7 @@ export class MocapRetargeter {
       // Foot: ankle, toe and heel form a triangle whose lateral normal, crossed
       // with the sole line, gives the sole's upward normal (foot roll).
       let footUp = this._t2.copy(up);
+      let soleRead = false;
       const heel = this.lm(`${p}_heel`);
       if (heel) {
         const ankle = j[SMPL[`${p}Ankle`]];
@@ -2140,12 +2153,39 @@ export class MocapRetargeter {
           this._t3.copy(toe).sub(heel);
           this._t1.crossVectors(this._t1, this._t3);
           if (this._t1.lengthSq() > 1e-10) {
-            if (this._t1.dot(up) < 0) this._t1.negate();
-            footUp = this._t2.copy(
-              this.smoothDir(`footUp${side}`, this._t1, dt));
+            // A cross product fixes the sole's normal only up to a sign, and
+            // the two landmarks cannot decide it: the triangle is nearly
+            // edge-on exactly when the toes are pointed, which in this dance is
+            // most of the time. Re-deciding the sign against the torso every
+            // frame therefore flipped the shoe right over - 17 frames of the
+            // live feed put the sole more than 90 degrees from horizontal while
+            // the person's never passed 81, at up to 170 degrees of roll and
+            // the 700 deg/s rate cap. Keep the hemisphere the foot arrived in
+            // and only take the torso's side for the first frame - and only
+            // when that frame is decisive, because a coin flip at the seed
+            // would hold the shoe rolled the wrong way for the whole take.
+            let usable = true;
+            if (!this._footUpOk[side]) {
+              const sided = this._t1.dot(up);
+              usable = Math.abs(sided) > 0.25;
+              if (usable && sided < 0) this._t1.negate();
+            } else if (this._t1.dot(this._footUpP[side]) < 0) {
+              this._t1.negate();
+            }
+            if (usable) {
+              footUp = this._t2.copy(
+                this.smoothDir(`footUp${side}`, this._t1, dt));
+              this._footUpP[side].copy(footUp);
+              this._footUpOk[side] = true;
+              soleRead = true;
+            }
           }
         }
       }
+      // With no heel to read, the reference above is the torso's up and the
+      // stored hemisphere no longer describes this foot; seed from the torso
+      // again when one comes back rather than testing against a stale side.
+      if (!soleRead) this._footUpOk[side] = false;
       // A cropped leg's ankle/toe/heel triangle is invented too, so the sole
       // falls back to flat-forward instead of following a heel that is not
       // there.
@@ -2388,6 +2428,7 @@ export class MocapRetargeter {
       this._armSeen[side].lower = 1;
       this._armBackOk[side] = false;
       this._foreDirOk[side] = false;
+      this._footUpOk[side] = false;
     }
     this._crop = 0;
     this._cropQw.identity();
