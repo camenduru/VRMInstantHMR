@@ -1,6 +1,6 @@
 # Build context for camenduru/vrminstanthmr.
 #
-# Kept: app/, scripts/, vrm_models/, videos/, web sources, requirements.txt.
+# Kept: app/, scripts/, vrm_models/, web sources, requirements.txt.
 # Everything the image needs at runtime is either here or fetched and pinned
 # by the Dockerfile; nothing is fetched when the container runs.
 
@@ -28,6 +28,13 @@ web/dist/
 web/.vite/
 web/test/
 npm-debug.log*
+
+# ---- media ---------------------------------------------------------------
+# Clips are mounted at run time (-v "$PWD/videos:/app/videos") and uploaded
+# through the page; a test clip must never be baked into the published image.
+# The Dockerfile creates an empty /app/videos, so the app still works without
+# the mount.
+videos/
 
 # ---- reference projects --------------------------------------------------
 # `feet/` and `filters/` are the upstream reference implementations this app's
