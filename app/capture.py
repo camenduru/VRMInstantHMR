@@ -3,10 +3,11 @@
 The capture owns exactly one input at a time: a video file (looped) or a
 camera index. Every frame goes two ways:
 
-* the unmirrored BGR frame is handed to ``frame_sink`` (the InstantHMR worker),
-  because the 3D model expects the real orientation;
-* a resized copy is annotated with the newest 3D skeleton and JPEG encoded for
-  the browser preview, exactly as the model sees it - not flipped.
+* the unmirrored BGR frame is drawn as the browser preview, so it reads
+  exactly as the camera sees it;
+* a mirrored copy is handed to ``frame_sink`` (the InstantHMR worker), so the
+  avatar moves like the person's reflection - the selfie view - while every
+  stage downstream of the model still works in one consistent frame.
 
 No pose model lives here: the preview skeleton is drawn from the 3D worker's
 2D landmarks, so the app has a single source of motion.
@@ -67,8 +68,8 @@ class Capture:
             'frames': 0,
             'media_t': None,
         }
-        # ``(frame_bgr, wall time)`` hook for the 3D worker; always the
-        # unmirrored capture frame
+        # ``(frame_bgr, wall time)`` hook for the 3D worker; the frame is handed
+        # over left/right mirrored so the avatar mirrors the person
         self.frame_sink = None
         # ``() -> live pose dict`` used only to draw the preview skeleton
         self.pose_provider = None
@@ -269,7 +270,9 @@ class Capture:
             sink = self.frame_sink
             if sink is not None:
                 try:
-                    sink(frame, time.time())
+                    # the model sees a mirrored frame, so the avatar mirrors the
+                    # person; the preview below still shows the raw frame
+                    sink(cv2.flip(frame, 1), time.time())
                 except Exception as exc:  # noqa: BLE001
                     print(f'[live3d] frame sink failed: {exc}', flush=True)
                     self.frame_sink = None
@@ -313,9 +316,10 @@ class Capture:
         preview = frame.copy()
         h, w = preview.shape[:2]
         if pose and pose.get('detected') and pose.get('skeleton2d'):
-            # the joints are normalised in the very frame the preview shows, so
-            # they land where they were measured - no x flip
+            # the joints are normalised in the frame the *model* saw, which is
+            # mirrored; the preview shows the raw frame, so mirror x back
             points = np.asarray(pose['skeleton2d'], np.float32)
+            points[:, 0] = 1.0 - points[:, 0]
             points[:, 0] *= w
             points[:, 1] *= h
             for a, b in SMPL_EDGES:
@@ -350,7 +354,9 @@ class Capture:
         sink = self.frame_sink
         if sink is not None:
             try:
-                sink(frame, wall_time)
+                # same as the file/camera path: the model sees a mirrored
+                # frame, so the avatar mirrors the person
+                sink(cv2.flip(frame, 1), wall_time)
             except Exception as exc:  # noqa: BLE001
                 print(f'[live3d] frame sink failed: {exc}', flush=True)
                 self.frame_sink = None

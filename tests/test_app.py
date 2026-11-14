@@ -17,6 +17,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -258,7 +259,7 @@ def _():
             raise AssertionError('a missing video was accepted')
 
 
-@check('the preview is not flipped and keeps its size')
+@check('the preview shows the raw frame and puts the joints back on it')
 def _():
     # the frame keeps its own left and right: right half bright, left half dark
     frame = np.zeros((720, 1280, 3), np.uint8)
@@ -268,19 +269,47 @@ def _():
     assert preview[:, :300].max() < 40, preview[:, :300].max()
     assert preview[:, 340:].min() > 200, preview[:, 340:].min()
 
-    # a joint measured at x=0.25 is drawn there, not at its mirror image
+    # the joints were measured in the mirrored frame the model saw, so a joint
+    # at x=0.25 there belongs at x=0.75 of the raw preview
     dark = np.zeros((720, 1280, 3), np.uint8)
     joints = [[0.25, 0.5]] * 22
     preview = Capture._render(
         dark, {'detected': True, 'skeleton2d': joints})
-    spot = preview[176:185, 156:165].astype(np.int32).sum(axis=2)
+    spot = preview[176:185, 476:485].astype(np.int32).sum(axis=2)
     assert spot.max() > 500, spot.max()
-    other = preview[176:185, 476:485].astype(np.int32).sum(axis=2)
-    assert other.max() == 0, 'the skeleton must not be mirrored into x=0.75'
+    other = preview[176:185, 156:165].astype(np.int32).sum(axis=2)
+    assert other.max() == 0, 'the skeleton must not stay in the model frame'
 
     flat = Capture._render(dark, None)
     assert flat.shape == (360, 640, 3)
     assert flat.max() == 0, 'no pose must leave the frame alone'
+
+
+@check('the model gets a mirrored frame while the preview does not')
+def _():
+    capture = Capture([])
+    with capture._lock:
+        capture.source = 'browser:camera'
+    seen = []
+    capture.frame_sink = lambda f, wall: seen.append(f.copy())
+
+    # left half bright, right half dark
+    frame = np.zeros((48, 64, 3), np.uint8)
+    frame[:, :32] = 255
+    assert capture.push_frame(frame) is True
+    assert len(seen) == 1, 'the sink must be called once'
+    fed = seen[0]
+    assert fed.shape == frame.shape
+    assert fed[:, :24].max() == 0, 'the model frame is not mirrored'
+    assert fed[:, 40:].min() == 255, 'the model frame is not mirrored'
+
+    # the browser preview is encoded from the untouched frame
+    jpeg, _ = capture.snapshot()
+    assert jpeg
+    shown = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    assert shown is not None
+    assert shown[:, :20].min() > 200, 'the preview got mirrored too'
+    assert shown[:, 44:].max() < 40, 'the preview got mirrored too'
 
 
 @check('the websocket carries the joints and their roll landmarks')
