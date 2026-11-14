@@ -82,19 +82,23 @@ bakes in:
 ### Run it from Docker Hub
 
 ```bash
-docker pull camenduru/vrminstanthmr:latest
+docker run -d --name vrminstanthmr --gpus all -p 8010:8010 camenduru/vrminstanthmr
+```
 
-# GPU (needs the NVIDIA Container Toolkit)
+That is the whole command: it pulls the image, runs it detached, and serves
+**http://localhost:8010**. The container listens on `0.0.0.0` and shows
+`(healthy)` in `docker ps` once `/api/status` answers; `docker logs -f
+vrminstanthmr` shows the worker's own output, and the page's **InstantHMR 3D**
+line reads `CUDAExecutionProvider` when the GPU was picked up. Without a GPU drop
+`--gpus all` — the same image falls back to the CPU, just slower.
+
+To watch the log in the foreground instead of detached, swap `-d` for `-it` and
+add `--rm`:
+
+```bash
 docker run --rm -it --gpus all -p 8010:8010 --name vrminstanthmr \
   camenduru/vrminstanthmr:latest
 ```
-
-Open **http://localhost:8010**. The container listens on `0.0.0.0` and shows
-`(healthy)` in `docker ps` once `/api/status` answers. Add `-d` to run detached,
-then `docker logs -f vrminstanthmr` for the worker's own output; the page's
-**InstantHMR 3D** line reads `CUDAExecutionProvider` when the GPU was picked up.
-Without a GPU drop `--gpus all` — the same image falls back to the CPU, just
-slower.
 
 **Everything runs inside the container — nothing is mounted.** `/app/videos`
 and `/app/vrm_models` are ordinary container paths, written by the page:
