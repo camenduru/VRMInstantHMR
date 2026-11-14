@@ -234,7 +234,11 @@ const state = {
   poseAt: 0,
   tracking: false,
   wsOpen: false,
+  wsLost: false,
   source: '',
+  desired: '',
+  sourceKnown: false,
+  bootId: '',
   capture: { state: 'starting', source: '', label: '', fps: 0 },
   liveInfo: null,
   liveBusy: false,
@@ -245,93 +249,353 @@ const state = {
   obs: false,
 };
 
-let browserCam = {
+/* --------------------------------------------------------- browser camera */
+// The container cannot reach the host webcam, so the page captures it and
+// streams JPEG frames to the server. That link has to outlive everything a
+// browser session outlives: a tab left open for hours, a phone that was
+// locked, a camera unplugged, a container restarted underneath the page, a
+// proxy that silently drops idle sockets. So the frames travel over one
+// persistent websocket — with the plain POST as the fallback while it is
+// reconnecting — and a watchdog rebuilds the whole pipeline when frames stop
+// being accepted.
+const CAMERA_FPS = 24;
+const CAMERA_JPEG = 0.82;
+const CAMERA_BACKOFF = [0, 400, 1000, 2000, 4000, 8000];   // ms, then capped
+const CAMERA_STALE_MS = 4000;         // nothing accepted this long: rebuild
+const CAMERA_BUSY_BYTES = 512 * 1024; // unsent backlog: skip this frame
+const CAMERA_SOURCE = 'browser:camera';
+const SOURCE_STORE = 'instanthmr.source';
+
+const browserCam = {
+  active: false,
+  starting: false,
   stream: null,
   video: null,
   canvas: null,
-  timer: 0,
-  sending: false,
-  active: false,
+  socket: null,
+  socketOpen: false,
+  sendTimer: 0,
+  retryTimer: 0,
+  watchdog: 0,
+  run: 0,
+  attempts: 0,
+  sent: 0,
+  lastOk: 0,
+  lastError: '',
+  asserted: 0,
+  socketTried: false,
 };
+
+function closeCameraSocket() {
+  const socket = browserCam.socket;
+  browserCam.socket = null;
+  browserCam.socketOpen = false;
+  if (!socket) return;
+  try {
+    socket.close();
+  } catch {
+    /* already gone */
+  }
+}
+
+function openCameraSocket() {
+  if (!browserCam.active || browserCam.socket) return;
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  let socket;
+  try {
+    socket = new WebSocket(`${proto}://${window.location.host}/ws/camera`);
+  } catch {
+    scheduleCameraRetry('could not open the frame socket');
+    return;
+  }
+  socket.binaryType = 'arraybuffer';
+  browserCam.socket = socket;
+
+  socket.addEventListener('open', () => {
+    browserCam.socketOpen = true;
+    browserCam.attempts = 0;
+    browserCam.lastOk = performance.now();   // a fresh socket gets a grace
+  });
+
+  socket.addEventListener('message', (event) => {
+    if (typeof event.data !== 'string') return;
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (message.type === 'ack' || message.type === 'ready' ||
+        message.type === 'pong' || message.type === 'tick') {
+      browserCam.lastOk = performance.now();
+    } else if (message.type === 'error') {
+      // the link is alive; the input is not. Take the camera back rather than
+      // letting the page sit on a source the server has already left.
+      browserCam.lastOk = performance.now();
+      browserCam.lastError = message.error || 'frame rejected';
+      assertCameraSource();
+    }
+  });
+
+  socket.addEventListener('close', () => {
+    if (browserCam.socket !== socket) return;   // replaced on purpose
+    browserCam.socket = null;
+    browserCam.socketOpen = false;
+    if (browserCam.active) scheduleCameraRetry('frame socket closed');
+  });
+
+  socket.addEventListener('error', () => {
+    /* a close always follows; the retry is scheduled there */
+  });
+}
+
+function scheduleCameraRetry(reason) {
+  if (!browserCam.active || browserCam.retryTimer) return;
+  browserCam.lastError = reason;
+  const wait = CAMERA_BACKOFF[
+    Math.min(browserCam.attempts, CAMERA_BACKOFF.length - 1)];
+  browserCam.attempts += 1;
+  browserCam.retryTimer = window.setTimeout(() => {
+    browserCam.retryTimer = 0;
+    if (!browserCam.active) return;
+    openCameraSocket();
+  }, wait);
+}
+
+/** Re-select the browser camera when the server is no longer on it. */
+function assertCameraSource() {
+  if (state.desired !== CAMERA_SOURCE) return;
+  const now = performance.now();
+  if (now - browserCam.asserted < 3000) return;
+  browserCam.asserted = now;
+  fetch('/api/source', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source: CAMERA_SOURCE }),
+  }).then((response) => {
+    if (!response.ok) return;
+    browserCam.attempts = 0;
+    closeCameraSocket();
+    openCameraSocket();
+  }).catch(() => {
+    /* the watchdog and the next frame keep trying */
+  });
+}
+
+function startCameraWatchdog() {
+  if (browserCam.watchdog) window.clearInterval(browserCam.watchdog);
+  browserCam.watchdog = window.setInterval(() => {
+    if (!browserCam.active) return;
+    if (performance.now() - browserCam.lastOk <= CAMERA_STALE_MS) {
+      browserCam.socketTried = false;   // the transport is healthy again
+      return;
+    }
+    if (browserCam.socketOpen && !browserCam.socketTried) {
+      // the socket looks open but nothing is coming back: replace the cheap
+      // half first, and only rebuild the device if that does not help
+      browserCam.socketTried = true;
+      browserCam.lastOk = performance.now();
+      closeCameraSocket();
+      openCameraSocket();
+      return;
+    }
+    restartBrowserCamera('no frame accepted for 4 s');
+  }, 1000);
+}
+
+/** Drop the device and the socket, then build both again from scratch. */
+function restartBrowserCamera(reason) {
+  if (!browserCam.active) return;
+  browserCam.lastError = reason || 'restarting';
+  browserCam.lastOk = performance.now();   // do not restart again at once
+  browserCam.run += 1;                     // orphan the running send loop
+  closeCameraSocket();
+  if (browserCam.stream) {
+    for (const track of browserCam.stream.getTracks()) {
+      track.onended = null;
+      track.stop();
+    }
+  }
+  browserCam.stream = null;
+  if (browserCam.video) browserCam.video.srcObject = null;
+  browserCam.video = null;
+  browserCam.attempts = 0;
+  acquireCamera();
+}
+
+function startCameraLoop() {
+  const run = browserCam.run += 1;
+  const tick = async () => {
+    if (!browserCam.active || browserCam.run !== run) return;
+    try {
+      await sendCameraFrame();
+    } catch {
+      /* a dropped frame never stops the stream */
+    }
+    if (browserCam.active && browserCam.run === run) {
+      browserCam.sendTimer = window.setTimeout(tick, 1000 / CAMERA_FPS);
+    }
+  };
+  tick();
+}
+
+async function sendCameraFrame() {
+  const video = browserCam.video;
+  if (!video || video.readyState < 2) return;
+  if (video.paused) video.play().catch(() => {});
+  const socket = browserCam.socket;
+  const socketReady = !!(socket && browserCam.socketOpen &&
+    socket.readyState === 1 &&
+    socket.bufferedAmount < CAMERA_BUSY_BYTES);
+  const width = video.videoWidth || 1280;
+  const height = video.videoHeight || 720;
+  const canvas = browserCam.canvas;
+  if (!canvas) return;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, width, height);
+  const blob = await new Promise((resolve) =>
+    canvas.toBlob(resolve, 'image/jpeg', CAMERA_JPEG));
+  if (!blob || !browserCam.active) return;
+  if (socketReady) {
+    const buffer = await blob.arrayBuffer();
+    if (!browserCam.active || browserCam.socket !== socket) return;
+    socket.send(buffer);
+    browserCam.sent += 1;
+    return;
+  }
+  await postCameraFrame(blob);
+}
+
+/** The fallback transport: one request per frame, bounded in time. */
+async function postCameraFrame(blob) {
+  const control = new AbortController();
+  const abort = window.setTimeout(() => control.abort(), 2000);
+  try {
+    const response = await fetch('/api/browser-frame', {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/jpeg' },
+      body: blob,
+      signal: control.signal,
+      cache: 'no-store',
+    });
+    browserCam.lastOk = performance.now();   // the server answered
+    if (response.ok) {
+      browserCam.sent += 1;
+    } else if (response.status === 409) {
+      assertCameraSource();
+    }
+  } catch {
+    /* server away or slower than 2 s: the watchdog rebuilds the link */
+  } finally {
+    window.clearTimeout(abort);
+  }
+}
 
 async function stopBrowserCamera() {
   browserCam.active = false;
-  if (browserCam.timer) {
-    window.clearInterval(browserCam.timer);
-    browserCam.timer = 0;
+  browserCam.starting = false;
+  browserCam.run += 1;
+  for (const key of ['sendTimer', 'retryTimer']) {
+    if (browserCam[key]) window.clearTimeout(browserCam[key]);
+    browserCam[key] = 0;
   }
+  if (browserCam.watchdog) window.clearInterval(browserCam.watchdog);
+  browserCam.watchdog = 0;
+  closeCameraSocket();
   if (browserCam.stream) {
-    for (const track of browserCam.stream.getTracks()) track.stop();
+    for (const track of browserCam.stream.getTracks()) {
+      track.onended = null;
+      track.stop();
+    }
   }
   browserCam.stream = null;
-  if (browserCam.video) {
-    browserCam.video.srcObject = null;
-  }
+  if (browserCam.video) browserCam.video.srcObject = null;
   browserCam.video = null;
   browserCam.canvas = null;
-  browserCam.sending = false;
+}
+
+/** Ask for the device again, backing off while it is unavailable. */
+async function acquireCamera() {
+  if (!browserCam.active || state.desired !== CAMERA_SOURCE) return;
+  browserCam.starting = true;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'user',
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    });
+  } catch (err) {
+    browserCam.starting = false;
+    browserCam.lastError = (err && err.name) || String(err);
+    if (browserCam.attempts === 0) {
+      // say it once; a retry storm must not bury the page in toasts
+      showToast(`Browser camera: ${err.message || err} - retrying`,
+        { error: true });
+    }
+    const wait = Math.max(500, CAMERA_BACKOFF[
+      Math.min(browserCam.attempts, CAMERA_BACKOFF.length - 1)]);
+    browserCam.attempts += 1;
+    if (browserCam.active && !browserCam.retryTimer) {
+      browserCam.retryTimer = window.setTimeout(() => {
+        browserCam.retryTimer = 0;
+        acquireCamera();
+      }, wait);
+    }
+    return;
+  }
+  browserCam.starting = false;
+  if (!browserCam.active || state.desired !== CAMERA_SOURCE) {
+    for (const track of stream.getTracks()) track.stop();
+    return;
+  }
+  const video = document.createElement('video');
+  video.autoplay = true;
+  video.playsInline = true;
+  video.muted = true;
+  video.srcObject = stream;
+  browserCam.stream = stream;
+  browserCam.video = video;
+  if (!browserCam.canvas) browserCam.canvas = document.createElement('canvas');
+  for (const track of stream.getTracks()) {
+    // unplugged, grabbed by another app, permission revoked, OS resumed from
+    // sleep: the device is gone, so replace it instead of leaving a dead feed
+    track.addEventListener('ended', () => {
+      if (browserCam.active) restartBrowserCamera('camera device ended');
+    });
+  }
+  try {
+    await video.play();
+  } catch {
+    /* autoplay policy: the send loop nudges it back */
+  }
+  if (!browserCam.active) return;
+  browserCam.attempts = 0;
+  browserCam.lastOk = performance.now();
+  openCameraSocket();
+  startCameraLoop();
 }
 
 async function startBrowserCamera() {
-  if (browserCam.active || state.source !== 'browser:camera') return;
+  if (browserCam.active || state.desired !== CAMERA_SOURCE) return;
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     showToast('Browser camera not supported in this browser',
       { sticky: true, error: true });
     return;
   }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
-      audio: false,
-    });
-    if (state.source !== 'browser:camera') {
-      for (const track of stream.getTracks()) track.stop();
-      return;
-    }
-    const video = document.createElement('video');
-    video.autoplay = true;
-    video.playsInline = true;
-    video.muted = true;
-    video.srcObject = stream;
-    await video.play().catch(() => {});
-    const canvas = document.createElement('canvas');
-    browserCam = { stream, video, canvas, timer: 0, sending: false, active: true };
-
-    const sendFrame = async () => {
-      if (!browserCam.active || browserCam.sending) return;
-      const v = browserCam.video;
-      if (!v || v.readyState < 2) return;
-      const w = v.videoWidth || 1280;
-      const h = v.videoHeight || 720;
-      if (browserCam.canvas.width !== w || browserCam.canvas.height !== h) {
-        browserCam.canvas.width = w;
-        browserCam.canvas.height = h;
-      }
-      const ctx = browserCam.canvas.getContext('2d');
-      ctx.drawImage(v, 0, 0, w, h);
-      browserCam.sending = true;
-      try {
-        const blob = await new Promise((resolve) =>
-          browserCam.canvas.toBlob(resolve, 'image/jpeg', 0.82));
-        if (!blob || !browserCam.active) return;
-        await fetch('/api/browser-frame', {
-          method: 'POST',
-          headers: { 'Content-Type': 'image/jpeg' },
-          body: blob,
-          keepalive: true,
-        });
-      } catch {
-        /* dropped frame; keep streaming */
-      } finally {
-        browserCam.sending = false;
-      }
-    };
-    browserCam.timer = window.setInterval(sendFrame, 1000 / 24);
-    sendFrame();
-  } catch (err) {
-    showToast(`Browser camera failed: ${err.message || err}`,
-      { sticky: true, error: true });
-  }
+  browserCam.active = true;
+  browserCam.attempts = 0;
+  browserCam.asserted = 0;
+  browserCam.lastOk = performance.now();
+  startCameraWatchdog();
+  await acquireCamera();
 }
 
 let blinkExpression = null;
@@ -500,12 +764,17 @@ function connect() {
   const socket = new WebSocket(`${proto}://${window.location.host}/ws/pose`);
 
   socket.addEventListener('open', () => {
+    const reconnected = state.wsLost;
     state.wsOpen = true;
+    state.wsLost = false;
     updateStatusPill();
+    // the MJPEG preview is a stream too: it died with the old server
+    if (reconnected) startFeed();
   });
 
   socket.addEventListener('close', () => {
     state.wsOpen = false;
+    state.wsLost = true;
     state.tracking = false;
     updateStatusPill();
     window.setTimeout(connect, 1500);
@@ -571,6 +840,9 @@ function updateStatusPill() {
     syncStatus('connecting', 'warn');
   } else if (cap.state === 'error') {
     syncStatus(cap.error || 'input error', 'error');
+  } else if (cap.source === CAMERA_SOURCE && cap.stale) {
+    // the page's own link is down, not the person: the watchdog is rebuilding
+    syncStatus('browser camera reconnecting', 'warn');
   } else if (!cap.source) {
     syncStatus('no input', 'warn');
   } else if (info && info.state === 'error') {
@@ -616,19 +888,64 @@ async function poll() {
     ]);
     state.capture = status.capture || {};
     state.liveInfo = status.live || null;
+    const boot = status.boot || '';
+    const restarted = !!boot && !!state.bootId && boot !== state.bootId;
+    if (boot) state.bootId = boot;
+
     const nextSource = status.capture?.source || state.source;
-    if (nextSource !== state.source) {
-      state.source = nextSource;
-      if (state.source === 'browser:camera') startBrowserCamera();
-      else if (browserCam.active) stopBrowserCamera();
-    } else {
-      state.source = nextSource;
-      if (state.source === 'browser:camera' && !browserCam.active) startBrowserCamera();
+    const changed = nextSource !== state.source;
+    state.source = nextSource;
+    if (!state.sourceKnown) {
+      state.sourceKnown = true;
+      if (!state.desired) state.desired = nextSource;
+    }
+    if (restarted && state.desired === CAMERA_SOURCE &&
+        nextSource !== CAMERA_SOURCE) {
+      // the container restarted and came back on its default input: the page
+      // still owns the webcam, so take it back instead of going dead
+      assertCameraSource();
+    } else if (changed && state.desired === CAMERA_SOURCE &&
+               nextSource !== CAMERA_SOURCE) {
+      // another tab or a --source changed the input: follow it, do not fight
+      state.desired = nextSource;
+    }
+    if (state.desired === CAMERA_SOURCE) {
+      if (!browserCam.active) startBrowserCamera();
+    } else if (browserCam.active) {
+      stopBrowserCamera();
     }
     renderSources(sources);
     renderStats();
   } catch {
     syncStatus('server offline', 'error');
+  }
+}
+
+/**
+ * Bring the webcam back after a reload when that was the last input.
+ *
+ * A container restart puts the server back on its default video; without this
+ * the page would silently lose the camera and wait for the user to notice.
+ */
+async function restoreSource() {
+  let stored = '';
+  try {
+    stored = localStorage.getItem(SOURCE_STORE) || '';
+  } catch {
+    return;
+  }
+  if (stored !== CAMERA_SOURCE) return;
+  state.desired = CAMERA_SOURCE;
+  if (state.source === CAMERA_SOURCE) return;
+  try {
+    const response = await fetch('/api/source', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: CAMERA_SOURCE }),
+    });
+    if (response.ok) showToast('Browser camera restored');
+  } catch {
+    /* the next poll retries through the watchdog */
   }
 }
 
@@ -706,9 +1023,16 @@ sourceSelect.addEventListener('change', async () => {
     state.pose = null;
     state.tracking = false;
     state.source = source;
+    state.desired = source;
+    state.sourceKnown = true;
     if (state.retargeter) state.retargeter.reset();
+    try {
+      localStorage.setItem(SOURCE_STORE, source);
+    } catch {
+      /* private mode: the choice just does not survive a reload */
+    }
     await stopBrowserCamera();
-    if (source === 'browser:camera') startBrowserCamera();
+    if (source === CAMERA_SOURCE) startBrowserCamera();
     showToast(`Input: ${sourceSelect.selectedOptions[0]?.textContent || source}`);
   } catch (err) {
     showToast(`Input failed: ${err.message}`, { sticky: true, error: true });
@@ -1004,6 +1328,7 @@ window.addEventListener('resize', () => {
 
 window.mocap = {
   state, scene, camera, controls, avatarRoot, renderer,
+  browserCamera: browserCam,
   setChroma, setChromaColor, setObsLayout, applySmoothing,
 };
 
@@ -1023,6 +1348,7 @@ requestAnimationFrame(animate);
     showToast(`VRM load failed: ${err.message}`,
       { sticky: true, error: true });
   }
+  await restoreSource();
   await poll();
   window.setInterval(poll, 1000);
 })();

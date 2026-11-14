@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import mimetypes
 import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import live as live_mod
-from .capture import Capture
+from .capture import BROWSER_SOURCE, Capture
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIST = ROOT / 'web' / 'dist'
@@ -34,6 +36,9 @@ VRM_DIR = ROOT / 'vrm_models'
 VIDEOS_DIR = ROOT / 'videos'
 UPLOAD_LIMIT = 512 * 1024 * 1024
 _boundary = 'frame'
+# Changes on every process start: how the page tells "the server restarted and
+# forgot my input" apart from "someone else picked another input".
+_BOOT_ID = f'{time.time_ns():x}'
 
 # Windows' mimetypes database does not always know .wasm; three.js does not
 # need it, but the preview/VRM fetch should not be mislabelled either.
@@ -55,6 +60,24 @@ def _vrm_assets() -> dict:
         'vrma': entry(vrma_files[0]) if vrma_files else None,
         'vrms': [entry(p) for p in vrm_files],
     }
+
+
+def _take_browser_frame(capture: Capture, body: bytes) -> str:
+    """Decode one pushed JPEG and hand it to the capture.
+
+    Runs off the event loop: a 720p decode plus the preview render and encode
+    is milliseconds of CPU, and doing that inline would stall the MJPEG preview
+    and the pose websocket for every frame the page sends.
+
+    Returns ``ok``, ``bad`` (not a JPEG) or ``source`` (the input is no longer
+    the browser camera, so the page has to re-assert it).
+    """
+    if not body:
+        return 'bad'
+    frame = cv2.imdecode(np.frombuffer(body, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        return 'bad'
+    return 'ok' if capture.push_frame(frame) else 'source'
 
 
 def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
@@ -97,7 +120,8 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
     async def status():
         return {'capture': capture.status(),
                 'live': live.status(),
-                'avatar': _vrm_assets()}
+                'avatar': _vrm_assets(),
+                'boot': _BOOT_ID}
 
     @app.get('/api/sources')
     async def sources():
@@ -157,22 +181,89 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
 
     @app.post('/api/browser-frame')
     async def browser_frame(request: Request):
-        """Receive a JPEG frame from the browser webcam (Web/MJPEG stream)."""
-        if capture.source != 'browser:camera':
-            return JSONResponse({'error': 'browser camera source not active'},
-                                status_code=409)
+        """One JPEG frame from the page's webcam (fallback transport).
+
+        The websocket below is what the page prefers; this stays because a
+        proxy that blocks websockets must not cost the user the camera.
+        """
+        if capture.source != BROWSER_SOURCE:
+            return JSONResponse({'error': 'browser camera source not active',
+                                 'source': capture.source}, status_code=409)
         body = await request.body()
         if not body:
             return JSONResponse({'error': 'empty frame'}, status_code=400)
-        arr = np.frombuffer(body, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
+        result = await asyncio.to_thread(_take_browser_frame, capture, body)
+        if result == 'bad':
             return JSONResponse({'error': 'could not decode frame'},
                                 status_code=400)
-        ok = capture.push_frame(frame)
-        if not ok:
-            return JSONResponse({'error': 'frame rejected'}, status_code=409)
+        if result == 'source':
+            return JSONResponse({'error': 'browser camera source not active',
+                                 'source': capture.source}, status_code=409)
         return {'ok': True}
+
+    @app.websocket('/ws/camera')
+    async def ws_camera(ws: WebSocket):
+        """The page's webcam as a stream of binary JPEG frames.
+
+        One socket for the whole session instead of a request per frame: no
+        per-frame handshake, no half-dead request left behind by a network
+        blip, and the idle ``ping`` below is how both ends notice that the
+        other one is gone (a restarted container, a dropped proxy, a laptop
+        that went to sleep).
+        """
+        await ws.accept()
+        frames = 0
+        last_ack = 0.0
+        try:
+            await ws.send_json({'type': 'ready',
+                                'source': capture.source,
+                                'active': capture.source == BROWSER_SOURCE})
+            while True:
+                try:
+                    message = await asyncio.wait_for(ws.receive(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    await ws.send_json({'type': 'ping', 'frames': frames})
+                    continue
+                if message['type'] == 'websocket.disconnect':
+                    return
+                body = message.get('bytes')
+                if body:
+                    if capture.source != BROWSER_SOURCE:
+                        await ws.send_json(
+                            {'type': 'error',
+                             'error': 'browser camera source not active',
+                             'source': capture.source})
+                        continue
+                    result = await asyncio.to_thread(
+                        _take_browser_frame, capture, body)
+                    frames += 1
+                    now = time.monotonic()
+                    if result != 'ok':
+                        await ws.send_json(
+                            {'type': 'error', 'error': result,
+                             'source': capture.source})
+                    elif now - last_ack >= 0.5:
+                        # a cheap ack is what the page's watchdog listens to
+                        last_ack = now
+                        await ws.send_json({'type': 'ack', 'frames': frames})
+                    continue
+                text = message.get('text') or ''
+                if text == 'ping':
+                    await ws.send_json({'type': 'pong', 'frames': frames})
+                    continue
+                try:
+                    payload = json.loads(text) if text else {}
+                except ValueError:
+                    payload = {}
+                if payload.get('type') == 'source':
+                    await ws.send_json({'type': 'state',
+                                        'source': capture.source,
+                                        'active': capture.source == BROWSER_SOURCE,
+                                        'frames': frames})
+        except WebSocketDisconnect:
+            return
+        except Exception:  # noqa: BLE001
+            return
 
     # -------------------------------------------------------------- live 3D
     @app.get('/api/live')
@@ -223,6 +314,7 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
         await ws.send_json({'type': 'hello', 'source': capture.source})
         last_pose = -1
         last_frame = -1
+        last_sent = time.monotonic()
         try:
             while True:
                 pose = live.pose()
@@ -256,6 +348,12 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
                             if pose.get('box2d'):
                                 message['box2d'] = pose['box2d']
                     await ws.send_json(message)
+                    last_sent = time.monotonic()
+                elif time.monotonic() - last_sent > 5.0:
+                    # a quiet source must not let a proxy (or a slept laptop)
+                    # drop this socket without either end noticing
+                    await ws.send_json({'type': 'tick'})
+                    last_sent = time.monotonic()
                 await asyncio.sleep(1 / 90)
         except WebSocketDisconnect:
             return

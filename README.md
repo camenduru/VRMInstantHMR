@@ -200,6 +200,36 @@ and `.dockerignore` keeps their ~212 MB out of the build context.
 * Drag to orbit, right-drag to pan, wheel to zoom. The bottom-right preview
   shows the input with the reconstructed 22-joint skeleton on it.
 
+### Browser camera
+
+A container cannot open the host's webcam, so **Input → Browser camera** takes
+the frames from the page instead: the tab captures the webcam and streams JPEG
+frames to the server, which treats them exactly like a local capture (preview,
+live InstantHMR, pose websocket). It needs a secure context, so
+`http://127.0.0.1:8010` and `http://localhost:8010` work, but a plain-HTTP LAN
+address does not — the browser blocks the camera there; put the page behind
+HTTPS (or a tunnel) if you need to reach it from another machine.
+
+The link is built to survive a long session, not just a short demo:
+
+* frames travel over one persistent websocket (`/ws/camera`) instead of a
+  request per frame, and fall back to `POST /api/browser-frame` while that
+  socket is reconnecting, so a proxy that drops idle sockets costs latency,
+  not the camera;
+* the server answers with an `ack` (and an idle `ping` when nothing is flowing),
+  and the page replaces the socket — then, if that does not help, the device
+  itself — when no answer arrives for four seconds;
+* a camera that disappears (unplugged, grabbed by another app, permission
+  revoked, the machine resumed from sleep) is re-opened automatically with a
+  backoff, not left dead;
+* a container restart comes back on its default input; the page notices the
+  new `boot` id and re-selects **Browser camera** by itself, and the choice is
+  remembered in the browser so a reload resumes the webcam too.
+
+The status pill shows `browser camera reconnecting` while it is recovering, and
+the preview freezes instead of showing a stale frame once the server marks the
+input `stale` (no frame for 2.5 s).
+
 ### OBS / green screen
 
 For a stream or a recording you usually want only the character, on a field a
