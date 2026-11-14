@@ -5,8 +5,8 @@ camera index. Every frame goes two ways:
 
 * the unmirrored BGR frame is handed to ``frame_sink`` (the InstantHMR worker),
   because the 3D model expects the real orientation;
-* a mirrored copy is resized, annotated with the newest 3D skeleton and JPEG
-  encoded for the browser preview, so the preview reads like a selfie.
+* a resized copy is annotated with the newest 3D skeleton and JPEG encoded for
+  the browser preview, exactly as the model sees it - not flipped.
 
 No pose model lives here: the preview skeleton is drawn from the 3D worker's
 2D landmarks, so the app has a single source of motion.
@@ -310,13 +310,12 @@ class Capture:
     # ---------------------------------------------------------------- preview
     @staticmethod
     def _render(frame: np.ndarray, pose: Optional[dict]) -> np.ndarray:
-        preview = cv2.flip(frame, 1)
+        preview = frame.copy()
         h, w = preview.shape[:2]
         if pose and pose.get('detected') and pose.get('skeleton2d'):
-            # the joints are normalised in the unmirrored frame; mirror x to
-            # match the preview
+            # the joints are normalised in the very frame the preview shows, so
+            # they land where they were measured - no x flip
             points = np.asarray(pose['skeleton2d'], np.float32)
-            points[:, 0] = 1.0 - points[:, 0]
             points[:, 0] *= w
             points[:, 1] *= h
             for a, b in SMPL_EDGES:

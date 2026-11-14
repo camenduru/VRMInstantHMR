@@ -258,18 +258,27 @@ def _():
             raise AssertionError('a missing video was accepted')
 
 
-@check('the preview mirrors the skeleton and keeps its size')
+@check('the preview is not flipped and keeps its size')
 def _():
+    # the frame keeps its own left and right: right half bright, left half dark
     frame = np.zeros((720, 1280, 3), np.uint8)
+    frame[:, 640:] = 255
+    preview = Capture._render(frame, None)
+    assert preview.shape == (360, 640, 3), preview.shape
+    assert preview[:, :300].max() < 40, preview[:, :300].max()
+    assert preview[:, 340:].min() > 200, preview[:, 340:].min()
+
+    # a joint measured at x=0.25 is drawn there, not at its mirror image
+    dark = np.zeros((720, 1280, 3), np.uint8)
     joints = [[0.25, 0.5]] * 22
     preview = Capture._render(
-        frame, {'detected': True, 'skeleton2d': joints})
-    assert preview.shape == (360, 640, 3), preview.shape
-    # unmirrored x=0.25 -> mirrored x=0.75 -> 480 in the 640-wide preview
-    spot = preview[176:185, 476:485].astype(np.int32).sum(axis=2)
+        dark, {'detected': True, 'skeleton2d': joints})
+    spot = preview[176:185, 156:165].astype(np.int32).sum(axis=2)
     assert spot.max() > 500, spot.max()
+    other = preview[176:185, 476:485].astype(np.int32).sum(axis=2)
+    assert other.max() == 0, 'the skeleton must not be mirrored into x=0.75'
 
-    flat = Capture._render(frame, None)
+    flat = Capture._render(dark, None)
     assert flat.shape == (360, 640, 3)
     assert flat.max() == 0, 'no pose must leave the frame alone'
 
