@@ -28,7 +28,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import live as live_mod
-from .capture import BROWSER_SOURCE, Capture
+from .capture import BROWSER_SOURCE, Capture, preview_mirrored
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB_DIST = ROOT / 'web' / 'dist'
@@ -361,6 +361,8 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
                     state = capture.status()
                     message = {'type': 'pose', 'seq': frame_seq,
                                'source': state.get('source', ''),
+                               'mirrored': preview_mirrored(
+                                   state.get('source', '')),
                                'width': state.get('width', 0),
                                'height': state.get('height', 0)}
                     if pose is not None:

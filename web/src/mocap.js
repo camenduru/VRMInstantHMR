@@ -50,6 +50,17 @@ const LEG = {
   left: [KP.rightHip, KP.rightKnee, KP.rightAnkle],
   right: [KP.leftHip, KP.leftKnee, KP.leftAnkle],
 };
+// The same chains without the swap, for an unmirrored input (a recorded clip):
+// the avatar's left reads the person's left, so the avatar copies the clip
+// instead of mirroring it.
+const ARM_SAME = {
+  left: [KP.leftShoulder, KP.leftElbow, KP.leftWrist],
+  right: [KP.rightShoulder, KP.rightElbow, KP.rightWrist],
+};
+const LEG_SAME = {
+  left: [KP.leftHip, KP.leftKnee, KP.leftAnkle],
+  right: [KP.rightHip, KP.rightKnee, KP.rightAnkle],
+};
 
 /**
  * SMPL-H body joints, as FlowHMR writes them (0-21; 22-51 are fingers and the
@@ -360,6 +371,11 @@ export class MocapRetargeter {
     this.gazeSmoothed = { x: 0, y: 0 };
     this._lookAtTarget = null;
     this.facing = 1; // +1 person faces the camera, -1 they turned away
+    // Whether this input is mirrored: true for a live camera (the selfie
+    // preview), false for a recorded clip, which plays the way it was shot.
+    // The server decides (app/capture.py preview_mirrored) and reports it with
+    // every pose frame, so the preview and the avatar can never disagree.
+    this.mirrored = true;
     this.dirState = new Map();
     // longest each limb has been seen to project, relative to this avatar's
     // own bone: the reference foreshortening is measured against
@@ -1076,6 +1092,11 @@ export class MocapRetargeter {
     dt = clamp(dt, 0.001, 0.1);
     this._dt = dt;
 
+    // The server owns this decision (a camera is mirrored, a clip is not) and
+    // sends it with every frame; a payload that predates the flag is treated as
+    // a mirrored camera, which is what it used to be.
+    this.mirrored = !pose || pose.mirrored !== false;
+
     // FlowHMR frames carry exact 3D joints instead of 2D keypoints; they take
     // the whole body path, including the root translation.
     if (pose && Array.isArray(pose.joints3d) &&
@@ -1166,7 +1187,7 @@ export class MocapRetargeter {
 
     // --- arms ----------------------------------------------------------
     for (const side of ['left', 'right']) {
-      const [jS, jE, jW] = ARM[side];
+      const [jS, jE, jW] = (this.mirrored ? ARM : ARM_SAME)[side];
       const shoulder = this.px(jS);
       const elbow = this.px(jE);
       const wrist = this.px(jW);
@@ -1183,7 +1204,7 @@ export class MocapRetargeter {
 
     // --- legs ----------------------------------------------------------
     for (const side of ['left', 'right']) {
-      const [jH, jK, jA] = LEG[side];
+      const [jH, jK, jA] = (this.mirrored ? LEG : LEG_SAME)[side];
       const hip = this.px(jH);
       const knee = this.px(jK);
       const ankle = this.px(jA);
@@ -2118,9 +2139,16 @@ export class MocapRetargeter {
     if (torso < 1e-3) return false;
 
     // camera axes -> avatar axes: a straight axis flip, no per-frame basis
+    //
+    // A mirrored input is inverted through the pelvis (x, y and z all negated),
+    // which is what puts the person's right hand on the avatar's left. An
+    // unmirrored clip keeps x, so the avatar copies the clip instead of
+    // mirroring it: the person's right hand stays the avatar's right hand.
+    const sx = this.mirrored ? -1 : 1;
     for (let i = 0; i < SMPL_BODY_JOINTS; i++) {
       const p = raw[i];
-      this._j3[i].set(pelvis.x - p.x, pelvis.y - p.y, pelvis.z - p.z);
+      this._j3[i].set(sx * (p.x - pelvis.x), pelvis.y - p.y,
+        pelvis.z - p.z);
     }
 
     // Optional auxiliary landmarks (ears/nose, elbows, heels, knuckles) live
@@ -2143,7 +2171,7 @@ export class MocapRetargeter {
         // noisy landmark pair spins a bone that the joints alone would not
         this._lmRaw.set(p[0], p[1], p[2]);
         this.smoothing.vector(this._lmRaw, `lm:${key}`, dt);
-        v.set(pelvis.x - this._lmRaw.x, pelvis.y - this._lmRaw.y,
+        v.set(sx * (this._lmRaw.x - pelvis.x), pelvis.y - this._lmRaw.y,
           pelvis.z - this._lmRaw.z);
         v.valid = true;
       }
@@ -2211,12 +2239,14 @@ export class MocapRetargeter {
 
     // Root travel uses the same fixed mapping, so walking towards the camera
     // moves the avatar towards the viewer regardless of which way it faces.
+    // x follows the joint map above: negated for a mirror, kept for a clip,
+    // otherwise the avatar walks the wrong way across the screen.
     if (!this.rootRef) {
       this.rootRef = pelvis.clone();
       this._rootDelta.set(0, 0, 0);
     } else {
       this._rootDelta.set(
-        this.rootRef.x - pelvis.x,
+        sx * (pelvis.x - this.rootRef.x),
         this.rootRef.y - pelvis.y,
         this.rootRef.z - pelvis.z,
       );
@@ -2314,9 +2344,13 @@ export class MocapRetargeter {
     this.poseBone('neck', dirJ(SMPL.neck, SMPL.head), shoulderFwd, w);
     this.poseBone('head', dirJ(SMPL.neck, SMPL.head), this._headFwd, w);
 
-    // --- limbs: the avatar's left reads the person's right ---------------
+    // --- limbs: the avatar's left reads the person's right on a mirrored
+    // input (a camera); on a clip it reads the person's left, so the avatar
+    // does what the clip does rather than its mirror image.
     for (const side of ['left', 'right']) {
-      const p = side === 'left' ? 'right' : 'left';
+      const p = this.mirrored
+        ? (side === 'left' ? 'right' : 'left')
+        : side;
 
       // clavicle: collar -> shoulder carries shrug and protraction. Its roll
       // is pinned to the rest roll (TWIST_LIMIT 0) - a clavicle does not spin
