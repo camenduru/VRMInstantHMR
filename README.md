@@ -227,8 +227,9 @@ The link is built to survive a long session, not just a short demo:
   revoked, the machine resumed from sleep) is re-opened automatically with a
   backoff, not left dead;
 * a container restart comes back on its default input; the page notices the
-  new `boot` id and re-selects **Browser camera** by itself, and the choice is
-  remembered in the browser so a reload resumes the webcam too.
+  new `boot` id and re-asserts whatever input it was on — camera or video — and
+  the choice is remembered in the browser, so a reload resumes it too. A source
+  that no longer exists is reported instead of being silently dropped.
 
 The status pill shows `browser camera reconnecting` while it is recovering, and
 the preview freezes instead of showing a stale frame once the server marks the
