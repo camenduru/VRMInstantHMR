@@ -191,7 +191,11 @@ and `.dockerignore` keeps their ~212 MB out of the build context.
   the window length in frames — and **De-jitter** holds movement smaller than a
   threshold as tracking noise, which is what removes the last stand-still
   shiver. The choice is remembered in the browser.
-* **Avatar** – **Load VRM…** swaps the avatar from disk, locally.
+* **Avatar** – **Load VRM…** swaps the avatar. The file is uploaded to
+  `vrm_models/` and the newest `.vrm` there is the one every window loads, so
+  the pick survives a reload, a second tab and **Clean window**; a `.vrm` copied
+  into that folder by hand behaves the same way. Mount the folder (see
+  [Docker](#docker)) if the avatar should outlive the container.
 * **OBS output** – **Chroma key** puts a flat key colour behind the avatar and
   takes the floor, grid, ring and blob shadow out of the shot. The two swatches
   are the usual keys — green `#00FF00` and blue `#0000FF` — and the picker
@@ -449,8 +453,10 @@ length, so the panel means one thing either way.
 | `POST` | `/api/live` | `{"action": "start"}` / `{"action": "stop"}` (optional `model`, `fit`, `detector`, `detector_stride`, `device`) |
 | `POST` | `/api/upload?name=clip.mp4` | store a video in `videos/` (raw body) |
 | `GET` | `/api/avatar` | default `.vrm` / idle `.vrma` URLs |
+| `POST` | `/api/avatar?name=me.vrm` | store an avatar in `vrm_models/`, newest wins (raw body) |
 | `GET` | `/video` | MJPEG preview with the live skeleton |
 | `WS` | `/ws/pose` | `{type: "pose", joints3d: [[x,y,z] × 22], landmarks: {nose, ears, elbows, heels, knuckles}, detected, live3d}` |
+| `WS` | `/ws/camera` | browser webcam frames in (binary JPEG), `ack` / `ping` out |
 
 ## Rebuilding the frontend
 

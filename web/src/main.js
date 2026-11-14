@@ -1266,15 +1266,46 @@ avatarInput.addEventListener('change', async () => {
   const file = avatarInput.files?.[0];
   avatarInput.value = '';
   if (!file) return;
-  const url = URL.createObjectURL(file);
+  const was = btnAvatar.textContent;
+  btnAvatar.disabled = true;
+  btnAvatar.textContent = 'Loading VRM…';
+  let local = '';
   try {
-    await loadAvatar(url, file.name);
-    showToast(`Avatar: ${file.name}`);
+    // Upload before loading. A picked file used to be shown from a blob URL,
+    // which dies with the window: the pick looked right until a clean window
+    // (or a reload, or OBS) went back to the avatar that was already on disk.
+    // Storing it makes the pick the server's answer for every window.
+    let url = '';
+    let label = file.name;
+    try {
+      const response = await fetch(
+        `/api/avatar?name=${encodeURIComponent(file.name)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: file,
+        },
+      );
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || 'upload failed');
+      url = data.avatar?.url || '';
+      label = data.avatar?.name || file.name;
+    } catch (err) {
+      // offline, or the server refused it: still show it here, and say so
+      local = URL.createObjectURL(file);
+      url = local;
+      showToast(`Avatar in this window only: ${err.message}`,
+        { error: true });
+    }
+    await loadAvatar(url, label);
+    if (!local) showToast(`Avatar: ${label}`);
   } catch (err) {
     showToast(`Avatar failed: ${err.message}`,
       { sticky: true, error: true });
   } finally {
-    URL.revokeObjectURL(url);
+    if (local) URL.revokeObjectURL(local);
+    btnAvatar.disabled = false;
+    btnAvatar.textContent = was;
   }
 });
 

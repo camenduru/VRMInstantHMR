@@ -35,6 +35,7 @@ WEB_DIST = ROOT / 'web' / 'dist'
 VRM_DIR = ROOT / 'vrm_models'
 VIDEOS_DIR = ROOT / 'videos'
 UPLOAD_LIMIT = 512 * 1024 * 1024
+VRM_LIMIT = 256 * 1024 * 1024
 _boundary = 'frame'
 # Changes on every process start: how the page tells "the server restarted and
 # forgot my input" apart from "someone else picked another input".
@@ -48,12 +49,19 @@ mimetypes.add_type('application/wasm', '.wasm')
 def _vrm_assets() -> dict:
     vrm_files = sorted(VRM_DIR.glob('*.vrm'))
     vrma_files = sorted(VRM_DIR.glob('*.vrma'))
-    preferred = next((p for p in vrm_files if p.name == 'AvatarSample_B.vrm'),
-                     vrm_files[0] if vrm_files else None)
+    # The newest file wins. A picked avatar is written here with a fresh mtime,
+    # so it is what every window loads afterwards - a window opened after the
+    # pick included - and a .vrm copied in by hand behaves the same way. The
+    # bundled sample is only the default because it is all the image ships.
+    preferred = (max(vrm_files, key=lambda p: (p.stat().st_mtime, p.name))
+                 if vrm_files else None)
 
     def entry(path: Path) -> dict:
+        stat = path.stat()
+        # size as well as mtime: two uploads of the same name inside one
+        # second must not share a URL, or the window keeps the old avatar
         return {'name': path.name,
-                'url': f'/vrm/{path.name}?v={int(path.stat().st_mtime)}'}
+                'url': f'/vrm/{path.name}?v={int(stat.st_mtime)}-{stat.st_size}'}
 
     return {
         'vrm': entry(preferred) if preferred else None,
@@ -306,6 +314,33 @@ def create_app(capture: Capture, live: live_mod.LiveInstantHMR,
             return JSONResponse({'error': 'no .vrm in vrm_models'},
                                 status_code=404)
         return assets
+
+    @app.post('/api/avatar')
+    async def upload_avatar(request: Request, name: str = 'avatar.vrm'):
+        """Store the VRM the user picked, so every window loads it from now on.
+
+        The page used to load a picked file from a blob URL: it looked right in
+        the window that picked it, and the next window - or a reload - fell back
+        to whatever was already on disk. Writing it here makes the pick the
+        server's answer, so a clean window, OBS and a second browser agree.
+        """
+        clean = re.sub(r'[^A-Za-z0-9._ -]+', '_', Path(name).name).strip(' .')
+        if not clean or Path(clean).suffix.lower() != '.vrm':
+            return JSONResponse({'error': 'expected a .vrm file'},
+                                status_code=400)
+        body = await request.body()
+        if not body:
+            return JSONResponse({'error': 'empty upload'}, status_code=400)
+        if len(body) > VRM_LIMIT:
+            return JSONResponse({'error': 'file too large'}, status_code=413)
+        # glTF binary magic: a renamed .png must not become the avatar and then
+        # break every window that tries to load it
+        if body[:4] != b'glTF':
+            return JSONResponse({'error': 'not a VRM/GLB file'},
+                                status_code=400)
+        VRM_DIR.mkdir(parents=True, exist_ok=True)
+        (VRM_DIR / clean).write_bytes(body)
+        return {'ok': True, 'avatar': _vrm_assets()['vrm']}
 
     # --------------------------------------------------------------- websocket
     @app.websocket('/ws/pose')
