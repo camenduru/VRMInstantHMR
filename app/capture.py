@@ -100,7 +100,10 @@ class Capture:
                       'kind': 'camera'} for i in range(CAMERAS))
         items.extend(self._videos())
         if self.source and not any(i['id'] == self.source for i in items):
-            items.insert(0, {'id': self.source, 'label': self.source,
+            kind, _, value = self.source.partition(':')
+            items.insert(0, {'id': self.source,
+                             'label': (f'{value} (missing)' if kind == 'video'
+                                       else self.source),
                              'kind': 'custom'})
         return items
 

@@ -237,6 +237,12 @@ const state = {
   wsLost: false,
   source: '',
   desired: '',
+  // The source the user just picked, until the capture thread has actually
+  // opened it. The server reports the old input for a moment after the switch
+  // is accepted, and a poll in that window used to put the select back on the
+  // camera - which looked exactly like "selecting a video switches me back".
+  switching: '',
+  switchAt: 0,
   sourceKnown: false,
   bootId: '',
   capture: { state: 'starting', source: '', label: '', fps: 0 },
@@ -333,7 +339,9 @@ function openCameraSocket() {
       // letting the page sit on a source the server has already left.
       browserCam.lastOk = performance.now();
       browserCam.lastError = message.error || 'frame rejected';
-      assertCameraSource();
+      // a frame that was already on the wire when the user picked another
+      // input is not a reason to grab the camera back
+      if (!state.switching) assertCameraSource();
     }
   });
 
@@ -364,7 +372,7 @@ function scheduleCameraRetry(reason) {
 
 /** Re-select the browser camera when the server is no longer on it. */
 function assertCameraSource() {
-  if (state.desired !== CAMERA_SOURCE) return;
+  if (state.desired !== CAMERA_SOURCE || state.switching) return;
   const now = performance.now();
   if (now - browserCam.asserted < 3000) return;
   browserCam.asserted = now;
@@ -380,6 +388,31 @@ function assertCameraSource() {
   }).catch(() => {
     /* the watchdog and the next frame keep trying */
   });
+}
+
+/**
+ * Put the page back on the input the user had before the server restarted.
+ *
+ * A restarted container comes up on its default input; the page would follow
+ * it and quietly lose the video or camera the user picked.
+ */
+async function reassertSource(source) {
+  if (!source) return;
+  state.switching = source;
+  state.switchAt = performance.now();
+  try {
+    const response = await fetch('/api/source', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source }),
+    });
+    if (response.ok) return;
+    state.switching = '';
+    state.desired = state.source;   // it is gone: follow the server instead
+    showToast(`Input unavailable: ${source}`, { error: true });
+  } catch {
+    /* offline: the next poll retries */
+  }
 }
 
 function startCameraWatchdog() {
@@ -899,11 +932,18 @@ async function poll() {
       state.sourceKnown = true;
       if (!state.desired) state.desired = nextSource;
     }
-    if (restarted && state.desired === CAMERA_SOURCE &&
-        nextSource !== CAMERA_SOURCE) {
-      // the container restarted and came back on its default input: the page
-      // still owns the webcam, so take it back instead of going dead
-      assertCameraSource();
+    if (state.switching) {
+      // the capture thread applies a switch a moment after it is accepted, so
+      // keep showing the user's pick until the server reports it, then hand
+      // the select back to the server
+      if (nextSource === state.switching ||
+          performance.now() - state.switchAt > 6000) {
+        state.switching = '';
+      }
+    } else if (restarted && state.desired && nextSource !== state.desired) {
+      // the container restarted and came back on its default input: take back
+      // whatever the user had picked, video included
+      reassertSource(state.desired);
     } else if (changed && state.desired === CAMERA_SOURCE &&
                nextSource !== CAMERA_SOURCE) {
       // another tab or a --source changed the input: follow it, do not fight
@@ -922,10 +962,11 @@ async function poll() {
 }
 
 /**
- * Bring the webcam back after a reload when that was the last input.
+ * Bring back the input the page was on, after a reload.
  *
- * A container restart puts the server back on its default video; without this
- * the page would silently lose the camera and wait for the user to notice.
+ * A container restart (or a fresh page) puts the server back on its default
+ * input; without this the page silently loses the camera or the video the user
+ * had picked. A stored source that no longer exists is dropped and reported.
  */
 async function restoreSource() {
   let stored = '';
@@ -934,18 +975,30 @@ async function restoreSource() {
   } catch {
     return;
   }
-  if (stored !== CAMERA_SOURCE) return;
-  state.desired = CAMERA_SOURCE;
-  if (state.source === CAMERA_SOURCE) return;
+  if (!stored) return;
+  state.desired = stored;
+  state.switching = stored;
+  state.switchAt = performance.now();
   try {
     const response = await fetch('/api/source', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: CAMERA_SOURCE }),
+      body: JSON.stringify({ source: stored }),
     });
-    if (response.ok) showToast('Browser camera restored');
+    if (response.ok) {
+      if (stored === CAMERA_SOURCE) showToast('Browser camera restored');
+      return;
+    }
+    state.switching = '';
+    state.desired = '';
+    try {
+      localStorage.removeItem(SOURCE_STORE);
+    } catch {
+      /* private mode: nothing to forget */
+    }
+    showToast(`Input unavailable: ${stored}`, { error: true });
   } catch {
-    /* the next poll retries through the watchdog */
+    state.switching = '';
   }
 }
 
@@ -962,8 +1015,24 @@ async function refreshLive() {
 
 /* --------------------------------------------------------------- sources */
 function renderSources(data) {
-  const items = data.sources || [];
-  const signature = items.map((item) => item.id).join('|');
+  state.sources = data;
+  const current = data.current || '';
+  // The user's pick wins over the server's report while a switch is in flight,
+  // and a source the server is still on keeps its option: an <option> that
+  // disappears sets the select to "" and the browser then paints the first
+  // entry - the camera - which read as the app switching back by itself.
+  const wanted = state.switching || current;
+  const items = (data.sources || []).slice();
+  for (const id of [wanted, current]) {
+    if (id && !items.some((item) => item.id === id)) {
+      items.push({
+        id,
+        label: id.startsWith('video:') ? `${id.slice(6)} (missing)` : id,
+        kind: 'custom',
+      });
+    }
+  }
+  const signature = items.map((item) => `${item.id}=${item.label}`).join('|');
   if (signature !== renderSources.signature) {
     renderSources.signature = signature;
     const cameras = items.filter((item) => item.kind === 'camera');
@@ -983,17 +1052,16 @@ function renderSources(data) {
       sourceSelect.appendChild(parent);
     }
   }
-  const current = data.current || '';
-  if (current && sourceSelect.value !== current) {
-    sourceSelect.value = current;
-    if (sourceSelect.value !== current && current.startsWith('video:')) {
-      // the select is rebuilt before a just-started source appears in it
-      const option = document.createElement('option');
-      option.value = current;
-      option.textContent = current.slice(6);
-      sourceSelect.appendChild(option);
-      sourceSelect.value = current;
-    }
+  if (wanted && sourceSelect.value !== wanted) sourceSelect.value = wanted;
+}
+
+/** Read the source list again, e.g. after a switch the server refused. */
+async function refreshSources() {
+  try {
+    renderSources(await fetch('/api/sources', { cache: 'no-store' })
+      .then((r) => r.json()));
+  } catch {
+    /* the poll retries */
   }
 }
 
@@ -1012,18 +1080,33 @@ feedImg.addEventListener('error', () => {
 
 sourceSelect.addEventListener('change', async () => {
   const source = sourceSelect.value;
+  if (!source) {
+    // a rebuilt list with no matching option: put the select back on the
+    // server's input instead of POSTing an empty source
+    renderSources(state.sources || {});
+    return;
+  }
+  const previous = state.source;
+  const label = sourceSelect.selectedOptions[0]?.textContent || source;
+  // Claim the input before the request. The camera watchdog, the socket error
+  // handler and the frame already on the wire all re-assert the camera while
+  // it is "desired", and any of them landing after this POST flips the server
+  // back to the camera - the reported "selecting a video switches me back".
+  state.desired = source;
+  state.switching = source;
+  state.switchAt = performance.now();
+  if (source !== CAMERA_SOURCE) await stopBrowserCamera();
   try {
     const response = await fetch('/api/source', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ source }),
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || 'could not switch input');
     state.pose = null;
     state.tracking = false;
     state.source = source;
-    state.desired = source;
     state.sourceKnown = true;
     if (state.retargeter) state.retargeter.reset();
     try {
@@ -1031,11 +1114,14 @@ sourceSelect.addEventListener('change', async () => {
     } catch {
       /* private mode: the choice just does not survive a reload */
     }
-    await stopBrowserCamera();
     if (source === CAMERA_SOURCE) startBrowserCamera();
-    showToast(`Input: ${sourceSelect.selectedOptions[0]?.textContent || source}`);
+    showToast(`Input: ${label}`);
   } catch (err) {
+    state.switching = '';
+    state.desired = previous;
+    if (previous === CAMERA_SOURCE) startBrowserCamera();
     showToast(`Input failed: ${err.message}`, { sticky: true, error: true });
+    await refreshSources();   // the list may have lost the entry
   }
 });
 
