@@ -96,29 +96,45 @@ then `docker logs -f vrminstanthmr` for the worker's own output; the page's
 Without a GPU drop `--gpus all` — the same image falls back to the CPU, just
 slower.
 
-**A fresh container has no clips.** `/app/videos` ships empty, so the app starts
-on `camera:0`; with no `/dev/video0` passed through that camera cannot open and
-the bottom-right preview stays blank. Either add a clip in the page
-(**Add video…** uploads into the container's `/app/videos` and switches to it,
-but `--rm` discards it on exit) or mount a folder:
+**Everything runs inside the container — nothing is mounted.** `/app/videos`
+and `/app/vrm_models` are ordinary container paths, written by the page:
+
+| What you add in the page | Where it lands |
+| --- | --- |
+| **Add video…** | `/app/videos/<name>`, then selected |
+| **Load VRM…** | `/app/vrm_models/<name>`; the newest file is what every window loads |
+
+The image ships `/app/videos` **empty** (no clip is baked in) and
+`/app/vrm_models` with the sample avatar plus its idle animation, so a fresh
+container starts on `camera:0`. With no `/dev/video0` passed through that camera
+cannot open and the bottom-right preview stays blank until you add a clip or
+connect the **Browser camera**.
+
+Those paths are in the container's writable layer, so they live and die with
+the container: `docker stop` / `docker start` keeps your uploads, while
+`docker rm` (or `--rm` on exit) takes them with it. To keep clips and avatars on
+the host instead, mount them — optional, and the commands above need none:
 
 | Mount | Effect |
 | --- | --- |
-| `-v "$PWD/videos:/app/videos"` | clips are listed at start, the first is selected, uploads survive |
-| `-v "$PWD/vrm_models:/app/vrm_models"` | your own `.vrm` / `.vrma` appear in **Load VRM…** |
+| `-v "$PWD/videos:/app/videos"` | host clips are listed at start, uploads survive a recreated container |
+| `-v "$PWD/vrm_models:/app/vrm_models"` | your own `.vrm` / `.vrma` appear in **Load VRM…** and survive |
 | `--device /dev/video0` | a real camera as `camera:0` |
 
 On Windows quote the host path instead: `-v "%cd%\videos:/app/videos"`.
 
 The image's `CMD` already carries `--host 0.0.0.0 --port 8010`, and `docker run`
 *replaces* a `CMD` rather than appending to it, so pinning an input at startup
-means repeating the command:
+means repeating the command — and the clip has to be inside the container
+first, so create it, copy the file in, then start it:
 
 ```bash
-docker run --rm -it --gpus all -p 8010:8010 \
-  -v "$PWD/videos:/app/videos" camenduru/vrminstanthmr:latest \
+docker create --gpus all -p 8010:8010 --name vrminstanthmr \
+  camenduru/vrminstanthmr:latest \
   /opt/app/bin/python -m app.server --host 0.0.0.0 --port 8010 \
   --source "video:clip.mp4"
+docker cp clip.mp4 vrminstanthmr:/app/videos/clip.mp4
+docker start vrminstanthmr
 ```
 
 Otherwise just pick the clip in the **Input** menu.
