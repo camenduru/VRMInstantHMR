@@ -5,10 +5,8 @@ camera index. Every frame goes two ways:
 
 * the unmirrored BGR frame is handed to ``frame_sink`` (the InstantHMR worker),
   because the 3D model expects the real orientation;
-* a copy is resized, annotated with the newest 3D skeleton and JPEG encoded for
-  the browser preview. A live camera is mirrored, so the preview reads like a
-  selfie; a recorded clip is not, because it has to look the way it was shot -
-  see :func:`preview_mirrored`.
+* a mirrored copy is resized, annotated with the newest 3D skeleton and JPEG
+  encoded for the browser preview, so the preview reads like a selfie.
 
 No pose model lives here: the preview skeleton is drawn from the 3D worker's
 2D landmarks, so the app has a single source of motion.
@@ -43,20 +41,6 @@ SMPL_EDGES = (
 )
 SKELETON_COLOR = (210, 242, 98)      # the UI's mint accent, as BGR
 JOINT_COLOR = (255, 255, 255)
-
-
-def preview_mirrored(source: str) -> bool:
-    """Whether this input is shown - and retargeted - as a mirror.
-
-    A live camera is mirrored like a selfie: your right hand stays on the right
-    of the preview, which is what makes the avatar feel like a mirror. A clip is
-    not: it has to play the way it was recorded, and the avatar has to copy it
-    the way it was recorded, so a dance never comes out left-handed.
-
-    The page needs the same answer for the 3D retargeting (it swaps left and
-    right for a mirrored feed), so the server reports it with every pose frame.
-    """
-    return not source.startswith('video:')
 
 
 class Capture:
@@ -297,7 +281,7 @@ class Capture:
                     pose = provider()
                 except Exception:  # noqa: BLE001
                     pose = None
-            preview = self._render(frame, pose, preview_mirrored(current))
+            preview = self._render(frame, pose)
 
             now = time.perf_counter()
             times.append(now)
@@ -325,16 +309,14 @@ class Capture:
 
     # ---------------------------------------------------------------- preview
     @staticmethod
-    def _render(frame: np.ndarray, pose: Optional[dict],
-                mirrored: bool = True) -> np.ndarray:
-        preview = cv2.flip(frame, 1) if mirrored else frame.copy()
+    def _render(frame: np.ndarray, pose: Optional[dict]) -> np.ndarray:
+        preview = cv2.flip(frame, 1)
         h, w = preview.shape[:2]
         if pose and pose.get('detected') and pose.get('skeleton2d'):
             # the joints are normalised in the unmirrored frame; mirror x to
             # match the preview
             points = np.asarray(pose['skeleton2d'], np.float32)
-            if mirrored:
-                points[:, 0] = 1.0 - points[:, 0]
+            points[:, 0] = 1.0 - points[:, 0]
             points[:, 0] *= w
             points[:, 1] *= h
             for a, b in SMPL_EDGES:
@@ -381,7 +363,7 @@ class Capture:
                 pose = provider()
             except Exception:  # noqa: BLE001
                 pose = None
-        preview = self._render(frame, pose, preview_mirrored(self.source))
+        preview = self._render(frame, pose)
 
         now = time.perf_counter()
         with self._lock:

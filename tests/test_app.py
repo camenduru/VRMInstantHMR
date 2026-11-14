@@ -274,30 +274,6 @@ def _():
     assert flat.max() == 0, 'no pose must leave the frame alone'
 
 
-@check('a clip preview keeps the clip\'s own left and right')
-def _():
-    frame = np.zeros((720, 1280, 3), np.uint8)
-    joints = [[0.25, 0.5]] * 22
-    preview = Capture._render(
-        frame, {'detected': True, 'skeleton2d': joints}, mirrored=False)
-    assert preview.shape == (360, 640, 3), preview.shape
-    # unmirrored x=0.25 stays at 160 in the 640-wide preview
-    spot = preview[176:185, 156:165].astype(np.int32).sum(axis=2)
-    assert spot.max() > 500, spot.max()
-    # and the other side must be clean, i.e. nothing was flipped into it
-    other = preview[176:185, 476:485].astype(np.int32).sum(axis=2)
-    assert other.max() == 0, other.max()
-
-
-@check('only a live camera is mirrored')
-def _():
-    from app.capture import preview_mirrored
-
-    assert preview_mirrored('camera:0') is True
-    assert preview_mirrored('browser:camera') is True
-    assert preview_mirrored('video:dance.mp4') is False
-
-
 @check('the websocket carries the joints and their roll landmarks')
 def _():
     from fastapi.testclient import TestClient
@@ -327,8 +303,6 @@ def _():
                     'the frame crop is judged from the 2D joints'
                 assert message['box2d'] == [0.1, 0.2, 0.9, 0.8], \
                     'the box tells the retargeter where the frame cuts the body'
-                assert message['mirrored'] is True, \
-                    'a camera frame is mirrored, and the avatar must swap sides'
 
 
 @check('the HTTP surface serves status, sources and the avatar')
